@@ -180,12 +180,7 @@ Computes sensitivities for:
 
 ## 📈 Performance
 
-The tensorial approach delivers dramatic speedups over traditional iterative methods:
-
-- **1,000 assets × 5,000 events**: ~100-500ms (GPU) vs ~10-60s (CPU loops)
-- **100,000 assets × 10,000 events**: ~2-5s (GPU) vs hours (CPU loops)
-
-Performance scales with hardware parallelism, not problem size.
+The tensorial approach delivers potential for dramatic speedups over traditional iterative methods. Performance scales with hardware parallelism, not problem size.
 
 ## 🧮 Mathematical Formulation
 
@@ -230,7 +225,9 @@ More examples and use cases will be added in future releases. Contributions are 
 
 ## 📧 Contact
 
-[Add your contact information here]
+Orlando Arroyo
+
+orlando.arroyo@uis.edu.co
 
 ## 🙏 Acknowledgments
 
