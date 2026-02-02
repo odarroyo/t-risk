@@ -49,8 +49,8 @@ Tensor_Risk_Engine/
 
 ### Requirements
 
-- Python 3.8+
-- TensorFlow 2.10+
+- Python 3.12
+- TensorFlow 2.16+
 - NumPy
 - Matplotlib
 
