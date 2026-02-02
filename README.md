@@ -1,6 +1,6 @@
 # Tensorial Risk Engine
 
-A **fully differentiable catastrophe risk assessment framework** leveraging tensor operations and automatic differentiation for GPU-accelerated risk calculations. This engine reformulates traditional task-based risk computation as tensor programs, enabling massive parallelization and gradient-based sensitivity analysis.
+A **fully differentiable risk computing engine** leveraging tensor operations and automatic differentiation for GPU-accelerated risk calculations. This engine reformulates traditional task-based risk computation as tensor programs, enabling massive parallelization and gradient-based sensitivity analysis.
 
 ## 🚀 Overview
 
