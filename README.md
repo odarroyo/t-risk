@@ -1,12 +1,12 @@
 # Tensorial Risk Engine
 
-A **fully differentiable catastrophe risk assessment framework** leveraging tensor operations and automatic differentiation for GPU-accelerated risk calculations. This engine reformulates traditional task-based risk computation as tensor programs, enabling massive parallelization and gradient-based sensitivity analysis.
+A **fully differentiable risk engine** leveraging tensor operations and automatic differentiation for GPU-accelerated risk calculations. This engine reformulates traditional task-based risk computation as tensor programs, enabling massive parallelization and gradient-based sensitivity analysis.
 
-**🌐 NEW:** Interactive web interface available! Run `streamlit run streamlit/app.py` for a complete browser-based risk analysis platform. See [Web Application](#-web-application) section below.
+Complemented by an interactive web interface available! Run `streamlit run streamlit/app.py` for a complete browser-based risk analysis platform. See [Web Application](#-web-application) section below.
 
 ## 🚀 Overview
 
-The Tensorial Risk Engine implements a complete probabilistic catastrophe risk assessment system that:
+The Tensorial Risk Engine implements a complete probabilistic risk assessment system that:
 
 - **🏎️ Accelerates computation** using GPU tensor operations (TensorFlow/Metal)
 - **📊 Scales efficiently** to millions of loss calculations with O(1) complexity on modern hardware
