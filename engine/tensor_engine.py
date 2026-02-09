@@ -26,13 +26,15 @@ from typing import Tuple, Dict, Optional
 # ==========================================
 
 def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int = 5, 
-                                 n_curve_points: int = 20) -> Tuple:
+                                 n_curve_points: int = 20, 
+                                 lambdas: Optional[np.ndarray] = None,
+                                 lambda_distribution: str = 'exponential') -> Tuple:
     """
     Generate synthetic portfolio data matching manuscript notation.
     
     Creates realistic synthetic data for catastrophe risk modeling including
     exposure values, building typologies, vulnerability curves, intensity grids,
-    and hazard intensity matrices.
+    hazard intensity matrices, and scenario occurrence rates.
     
     Parameters
     ----------
@@ -44,6 +46,10 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
         Number of building typologies/vulnerability curves (K), default is 5
     n_curve_points : int, optional
         Number of discretization points for vulnerability curves (M), default is 20
+    lambdas : np.ndarray, optional
+        Pre-specified scenario occurrence rates ∈ ℝ^Q. If None, will be generated
+    lambda_distribution : str, optional
+        Distribution type for generated lambdas: 'uniform' or 'exponential', default is 'exponential'
     
     Returns
     -------
@@ -62,19 +68,23 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
     H_intensities : np.ndarray, shape (N, Q)
         Hazard intensity matrix ∈ ℝ^(N×Q)
         H[i,q] = ground motion intensity at asset i during event q
+    lambdas_out : np.ndarray, shape (Q,)
+        Scenario occurrence rate vector ∈ ℝ^Q
+        λ_q = annual occurrence rate of event q (events/year)
     
     Notes
     -----
     - Uses sigmoid functions to generate realistic vulnerability curves
     - Different typologies have varying fragility (steepness) and thresholds
     - Hazard intensities are uniformly distributed for demonstration purposes
+    - Exponential distribution for lambdas mimics importance sampling typical in CAT modeling
     - Fixed random seed (42) ensures reproducible results
     
     Examples
     --------
-    >>> v, u, C, x, H = generate_synthetic_portfolio(1000, 5000, 5, 20)
-    >>> print(v.shape, u.shape, C.shape, x.shape, H.shape)
-    (1000,) (1000,) (5, 20) (20,) (1000, 5000)
+    >>> v, u, C, x, H, lambdas = generate_synthetic_portfolio(1000, 5000, 5, 20)
+    >>> print(v.shape, u.shape, C.shape, x.shape, H.shape, lambdas.shape)
+    (1000,) (1000,) (5, 20) (20,) (1000, 5000) (5000,)
     """
     np.random.seed(42)
     
@@ -103,7 +113,23 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
     # Different intensity at each building for each earthquake scenario
     H_intensities = np.random.uniform(0.0, 1.2, (n_assets, n_events)).astype(np.float32)
     
-    return v_exposure, u_typology, C_matrix, x_grid, H_intensities
+    # Scenario Occurrence Rate Vector λ ∈ ℝ^Q (Manuscript Section 3c)
+    if lambdas is None:
+        if lambda_distribution == 'uniform':
+            # Uniform rates: λ_q = 1/Q for all q
+            lambdas_out = np.ones(n_events, dtype=np.float32) / n_events
+        elif lambda_distribution == 'exponential':
+            # Exponential decay: typical for importance sampling in CAT modeling
+            # Higher rates for more frequent (lower intensity) events
+            lambdas_out = np.exp(-np.linspace(0, 3, n_events)).astype(np.float32)
+            # Normalize so that sum equals 1.0 (interpretable as probabilities)
+            lambdas_out = lambdas_out / lambdas_out.sum()
+        else:
+            raise ValueError(f"Unknown lambda_distribution: {lambda_distribution}")
+    else:
+        lambdas_out = lambdas.astype(np.float32)
+    
+    return v_exposure, u_typology, C_matrix, x_grid, H_intensities, lambdas_out
 
 # ==========================================
 # 2. DETERMINISTIC FORMULATION (Section 2)
@@ -322,19 +348,23 @@ def probabilistic_loss_matrix(v: tf.Tensor, u: tf.Tensor, C: tf.Tensor,
 
 
 @tf.function
-def compute_risk_metrics(J_matrix: tf.Tensor) -> Dict[str, tf.Tensor]:
+def compute_risk_metrics(J_matrix: tf.Tensor, lambdas: Optional[tf.Tensor] = None) -> Dict[str, tf.Tensor]:
     """
-    Compute comprehensive risk metrics from loss matrix (Manuscript Section 3, Eq. 5-6).
+    Compute comprehensive risk metrics from loss matrix (Manuscript Section 3c).
     
-    Derives standard catastrophe risk metrics by aggregating the loss matrix
-    across different dimensions. Implements manuscript equations:
-    - Eq. 5: AAL_i = (1/Q) Σ_q J[i,q]
-    - Eq. 6: σ²_i = (1/Q) Σ_q (J[i,q] - AAL_i)²
+    Derives catastrophe risk metrics by aggregating the loss matrix with
+    scenario occurrence rates. Implements rate-weighted manuscript equations:
+    - AAL_i = Σ_q λ_q × J[i,q]  (rate-weighted annual loss)
+    - μ_i = AAL_i / Λ = Σ_q w_q × J[i,q]  (mean per event)
+    - σ²_i = Σ_q w_q × (J[i,q] - μ_i)²  (rate-weighted variance)
     
     Parameters
     ----------
     J_matrix : tf.Tensor, shape (N, Q), dtype float32
         Loss matrix where J[i,q] is loss of asset i in event q ∈ ℝ^(N×Q)
+    lambdas : tf.Tensor, shape (Q,), dtype float32, optional
+        Scenario occurrence rate vector ∈ ℝ^Q where λ_q ≥ 0
+        If None, uniform rates (1/Q) are used for backward compatibility
     
     Returns
     -------
@@ -342,16 +372,20 @@ def compute_risk_metrics(J_matrix: tf.Tensor) -> Dict[str, tf.Tensor]:
         Dictionary containing the following risk metrics:
         
         aal_per_asset : tf.Tensor, shape (N,), dtype float32
-            Average Annual Loss per asset (Manuscript Eq. 5) ∈ ℝ^N
-            AAL_i = (1/Q) Σ_q J[i,q]
+            Rate-weighted Average Annual Loss per asset ∈ ℝ^N
+            AAL_i = Σ_q λ_q × J[i,q]
             
         aal_portfolio : tf.Tensor, scalar, dtype float32
             Total portfolio Average Annual Loss
             AAL_portfolio = Σ_i AAL_i
             
+        mean_per_event_per_asset : tf.Tensor, shape (N,), dtype float32
+            Mean loss per event occurrence per asset ∈ ℝ^N
+            μ_i = AAL_i / Λ = Σ_q w_q × J[i,q]
+            
         variance_per_asset : tf.Tensor, shape (N,), dtype float32
-            Variance of loss per asset (Manuscript Eq. 6) ∈ ℝ^N
-            σ²_i = (1/Q) Σ_q (J[i,q] - AAL_i)²
+            Rate-weighted variance of loss per asset ∈ ℝ^N
+            σ²_i = Σ_q w_q × (J[i,q] - μ_i)²
             
         std_per_asset : tf.Tensor, shape (N,), dtype float32
             Standard deviation of loss per asset ∈ ℝ^N
@@ -360,55 +394,73 @@ def compute_risk_metrics(J_matrix: tf.Tensor) -> Dict[str, tf.Tensor]:
         loss_per_event : tf.Tensor, shape (Q,), dtype float32
             Total portfolio loss for each event ∈ ℝ^Q
             L_q = Σ_i J[i,q]
+            
+        total_rate : tf.Tensor, scalar, dtype float32
+            Total occurrence rate Λ = Σ_q λ_q
     
     Notes
     -----
-    - All computations are differentiable w.r.t. J_matrix
-    - AAL represents expected loss over long time horizon
-    - Variance quantifies uncertainty/volatility of losses
-    - Loss per event enables event-based risk analysis
+    - All computations are differentiable w.r.t. J_matrix and lambdas
+    - AAL represents rate-weighted expected annual loss
+    - Variance is weighted by normalized rates w_q = λ_q / Λ
+    - When lambdas is uniform (λ_q = 1/Q), reduces to simple averaging
+    - Loss per event is independent of rates (intrinsic to scenarios)
     
     Applications
     ------------
-    - Portfolio risk quantification
+    - Portfolio risk quantification with importance sampling
+    - Non-uniform event catalogs (varying return periods)
     - Asset-level risk ranking
     - Uncertainty analysis
-    - Exceedance probability curves
     - Risk-based capital requirements
     
     Examples
     --------
     >>> J = tf.constant([[1000., 2000., 3000.],
     ...                   [500., 1500., 2500.]], dtype=tf.float32)
-    >>> metrics = compute_risk_metrics(J)
+    >>> lambdas = tf.constant([0.5, 0.3, 0.2], dtype=tf.float32)
+    >>> metrics = compute_risk_metrics(J, lambdas)
     >>> print(f"Portfolio AAL: ${metrics['aal_portfolio'].numpy():.2f}")
     >>> print(f"Asset 0 AAL: ${metrics['aal_per_asset'][0].numpy():.2f}")
-    >>> print(f"Asset 0 Std: ${metrics['std_per_asset'][0].numpy():.2f}")
     """
     Q = tf.cast(tf.shape(J_matrix)[1], tf.float32)
     
-    # Per-asset AAL (Manuscript Eq. 5): AAL_i = (1/Q) Σ_q J[i,q]
-    aal_per_asset = tf.reduce_mean(J_matrix, axis=1)
+    # Handle backward compatibility: if no lambdas, use uniform rates
+    if lambdas is None:
+        lambdas = tf.ones(tf.shape(J_matrix)[1], dtype=tf.float32) / Q
+    
+    # Total occurrence rate Λ = Σ_q λ_q
+    Lambda = tf.reduce_sum(lambdas)
+    
+    # Normalized weights w_q = λ_q / Λ (sum to 1)
+    w = lambdas / (Lambda + 1e-10)  # Add epsilon for numerical stability
+    
+    # Per-asset AAL (Manuscript Section 3c): AAL_i = Σ_q λ_q × J[i,q]
+    # Shape: (N,) = (N, Q) @ (Q,)
+    aal_per_asset = tf.reduce_sum(J_matrix * tf.expand_dims(lambdas, 0), axis=1)
     
     # Portfolio AAL: sum across all assets
     aal_portfolio = tf.reduce_sum(aal_per_asset)
     
-    # Variance per asset (Manuscript Eq. 6): σ²_i = (1/Q) Σ_q (J[i,q] - AAL_i)²
-    variance_per_asset = tf.reduce_mean(
-        tf.square(J_matrix - tf.expand_dims(aal_per_asset, 1)), 
-        axis=1
-    )
+    # Mean loss per event: μ_i = AAL_i / Λ = Σ_q w_q × J[i,q]
+    mean_per_event_per_asset = aal_per_asset / (Lambda + 1e-10)
+    
+    # Rate-weighted variance per asset: σ²_i = Σ_q w_q × (J[i,q] - μ_i)²
+    deviations_sq = tf.square(J_matrix - tf.expand_dims(mean_per_event_per_asset, 1))
+    variance_per_asset = tf.reduce_sum(deviations_sq * tf.expand_dims(w, 0), axis=1)
     std_per_asset = tf.sqrt(variance_per_asset)
     
-    # Loss per event (for event-based analysis)
+    # Loss per event (independent of rates)
     loss_per_event = tf.reduce_sum(J_matrix, axis=0)
     
     return {
         'aal_per_asset': aal_per_asset,
         'aal_portfolio': aal_portfolio,
+        'mean_per_event_per_asset': mean_per_event_per_asset,
         'variance_per_asset': variance_per_asset,
         'std_per_asset': std_per_asset,
-        'loss_per_event': loss_per_event
+        'loss_per_event': loss_per_event,
+        'total_rate': Lambda
     }
 
 
@@ -493,7 +545,7 @@ class TensorialRiskEngine:
     """
     
     def __init__(self, v: np.ndarray, u: np.ndarray, C: np.ndarray, 
-                 x_grid: np.ndarray, H: np.ndarray):
+                 x_grid: np.ndarray, H: np.ndarray, lambdas: Optional[np.ndarray] = None):
         """
         Initialize the tensorial risk engine with portfolio data.
         
@@ -512,12 +564,16 @@ class TensorialRiskEngine:
             Intensity grid vector ∈ ℝ^M
         H : np.ndarray, shape (N, Q)
             Hazard intensity matrix ∈ ℝ^(N×Q)
+        lambdas : np.ndarray, shape (Q,), optional
+            Scenario occurrence rate vector ∈ ℝ^Q
+            If None, uniform rates (1/Q) will be used
         
         Notes
         -----
         The initialization creates:
-        - tf.Variable for v, C, H (differentiable parameters)
+        - tf.Variable for v, C, H, lambdas (differentiable parameters)
         - tf.Constant for u, x_grid (non-differentiable indices/grid)
+        - Backward compatible: lambdas defaults to uniform if not provided
         """
         self.v = tf.Variable(v, dtype=tf.float32, name='exposure')
         self.u = tf.constant(u, dtype=tf.int32, name='typology')
@@ -528,14 +584,20 @@ class TensorialRiskEngine:
         self.n_assets = v.shape[0]
         self.n_events = H.shape[1]
         self.n_typologies = C.shape[0]
+        
+        # Scenario occurrence rates (Manuscript Section 3c)
+        if lambdas is None:
+            # Backward compatibility: uniform rates
+            lambdas = np.ones(self.n_events, dtype=np.float32) / self.n_events
+        self.lambdas = tf.Variable(lambdas, dtype=tf.float32, name='scenario_rates')
     
     def compute_loss_and_metrics(self) -> Tuple[tf.Tensor, Dict]:
         """
-        Compute complete loss matrix and risk metrics.
+        Compute complete loss matrix and rate-weighted risk metrics.
         
         Executes the probabilistic hazard formulation to generate the full
-        N×Q loss matrix, then computes all derived risk metrics including
-        AAL, variance, and standard deviation.
+        N×Q loss matrix, then computes all derived risk metrics using
+        scenario occurrence rates (Manuscript Section 3c).
         
         Returns
         -------
@@ -543,36 +605,41 @@ class TensorialRiskEngine:
             Complete loss matrix ∈ ℝ^(N×Q)
             J[i,q] = loss of asset i in event q
         metrics : dict
-            Dictionary of risk metrics containing:
-            - aal_per_asset : Per-asset Average Annual Loss ∈ ℝ^N
+            Dictionary of rate-weighted risk metrics containing:
+            - aal_per_asset : Rate-weighted AAL per asset ∈ ℝ^N
             - aal_portfolio : Total portfolio AAL (scalar)
-            - variance_per_asset : Variance per asset ∈ ℝ^N
-            - std_per_asset : Standard deviation per asset ∈ ℝ^N
+            - mean_per_event_per_asset : Mean per event ∈ ℝ^N
+            - variance_per_asset : Rate-weighted variance ∈ ℝ^N
+            - std_per_asset : Standard deviation ∈ ℝ^N
             - loss_per_event : Total loss per event ∈ ℝ^Q
+            - total_rate : Total occurrence rate Λ
         
         Notes
         -----
-        This method is the core probabilistic calculation, implementing
-        Manuscript Section 3 equations 4-6.
+        This method implements Manuscript Section 3c with non-uniform
+        scenario occurrence rates via the lambda vector.
         
         Examples
         --------
         >>> J_matrix, metrics = engine.compute_loss_and_metrics()
         >>> print(f"Shape: {J_matrix.shape}")
         >>> print(f"AAL: ${metrics['aal_portfolio'].numpy():,.2f}")
+        >>> print(f"Total rate Λ: {metrics['total_rate'].numpy():.4f}")
         """
         J_matrix = probabilistic_loss_matrix(
             self.v, self.u, self.C, self.x_grid, self.H
         )
-        metrics = compute_risk_metrics(J_matrix)
+        metrics = compute_risk_metrics(J_matrix, self.lambdas)
         return J_matrix, metrics
     
     def gradient_wrt_vulnerability(self) -> Tuple[tf.Tensor, Dict]:
         """
-        Compute gradient of AAL w.r.t. vulnerability curves (Manuscript Section 4).
+        Compute gradient of rate-weighted AAL w.r.t. vulnerability curves (Manuscript Section 4c).
         
         Calculates ∂(AAL)/∂C using automatic differentiation, answering the question:
         "How sensitive is portfolio risk to changes in each vulnerability curve point?"
+        
+        Uses rate-weighted formulation: AAL = Σ_q λ_q × Σ_i J[i,q]
         
         This gradient identifies which parts of which vulnerability curves have the
         greatest impact on portfolio loss, enabling:
@@ -618,10 +685,12 @@ class TensorialRiskEngine:
     
     def gradient_wrt_exposure(self) -> Tuple[tf.Tensor, Dict]:
         """
-        Compute gradient of AAL w.r.t. exposure values (Manuscript Section 5).
+        Compute gradient of rate-weighted AAL w.r.t. exposure values (Manuscript Section 5c).
         
         Calculates ∂(AAL)/∂v using automatic differentiation, answering the question:
         "How much does portfolio AAL increase per additional dollar of exposure at each asset?"
+        
+        Uses rate-weighted formulation: ∂AAL/∂v_i = Σ_q λ_q × MDR[i,q]
         
         This gradient provides asset-level risk importance, enabling:
         - Identification of risk concentration
@@ -668,10 +737,12 @@ class TensorialRiskEngine:
     
     def gradient_wrt_hazard(self) -> Tuple[tf.Tensor, Dict]:
         """
-        Compute gradient of AAL w.r.t. hazard intensities (Manuscript Section 5).
+        Compute gradient of rate-weighted AAL w.r.t. hazard intensities (Manuscript Section 5c).
         
         Calculates ∂(AAL)/∂H using automatic differentiation, answering the question:
         "How sensitive is portfolio risk to changes in hazard intensity estimates?"
+        
+        Uses rate-weighted formulation: ∂AAL/∂H[i,q] includes λ_q factor
         
         This gradient quantifies hazard uncertainty impact, enabling:
         - Hazard model sensitivity analysis
@@ -723,11 +794,67 @@ class TensorialRiskEngine:
         grad_H = tape.gradient(aal, self.H)
         return grad_H, metrics
     
+    def gradient_wrt_lambdas(self) -> Tuple[tf.Tensor, Dict]:
+        """
+        Compute gradient of AAL w.r.t. scenario occurrence rates (Manuscript Section 3c).
+        
+        Calculates ∂(AAL)/∂λ using automatic differentiation, answering the question:
+        "How sensitive is portfolio AAL to changes in scenario occurrence rates?"
+        
+        This gradient quantifies scenario importance and enables:
+        - Understanding which scenarios drive portfolio risk
+        - Sensitivity to event catalog composition
+        - Importance sampling analysis
+        - Event set optimization
+        
+        Returns
+        -------
+        grad_lambdas : tf.Tensor, shape (Q,), dtype float32
+            Gradient of portfolio AAL w.r.t. scenario rates ∈ ℝ^Q
+            grad_lambdas[q] = ∂(AAL)/∂λ_q = Σ_i J[i,q]
+            Units: dollars (portfolio loss for event q)
+        metrics : dict
+            Current risk metrics
+        
+        Interpretation
+        --------------
+        - grad_lambdas[q] = total portfolio loss in event q
+        - Higher values indicate scenarios that contribute more to AAL
+        - Positive values (always): more frequent events increase AAL
+        - Magnitude indicates criticality of each scenario
+        
+        Applications
+        ------------
+        - Identify most critical scenarios in event catalog
+        - Optimize importance sampling weights
+        - Sensitivity to catalog completeness
+        - Event set pruning decisions
+        
+        Notes
+        -----
+        - Gradient is simply the loss per event: ∂(Σ_q λ_q × L_q)/∂λ_q = L_q
+        - Useful for understanding scenario contributions to risk
+        - Can guide event catalog refinement
+        
+        Examples
+        --------
+        >>> grad_lambdas, metrics = engine.gradient_wrt_lambdas()
+        >>> critical_events = tf.argsort(grad_lambdas, direction='DESCENDING')[:10]
+        >>> print(f"Top 10 critical events: {critical_events.numpy()}")
+        >>> print(f"Most critical event loss: ${grad_lambdas[critical_events[0]].numpy():,.2f}")
+        """
+        with tf.GradientTape() as tape:
+            J_matrix, metrics = self.compute_loss_and_metrics()
+            aal = metrics['aal_portfolio']
+        
+        grad_lambdas = tape.gradient(aal, self.lambdas)
+        return grad_lambdas, metrics
+    
     def full_gradient_analysis(self) -> Dict:
         """
-        Compute complete gradient analysis for all parameters (Manuscript Eq. 1).
+        Compute complete gradient analysis for all parameters (Manuscript Sections 3c-5c).
         
-        Calculates the full gradient vector ∇J = [∂J/∂H, ∂J/∂C, ∂J/∂v] in a single
+        Calculates the full gradient vector ∇J = [∂J/∂H, ∂J/∂C, ∂J/∂v, ∂J/∂λ] in a single
         pass using persistent gradient tape. This provides complete sensitivity
         information for portfolio optimization and uncertainty quantification.
         
@@ -737,16 +864,19 @@ class TensorialRiskEngine:
             Complete analysis results containing:
             
             grad_hazard : tf.Tensor, shape (N, Q), dtype float32
-                ∂(AAL)/∂H - Hazard intensity sensitivity
+                ∂(AAL)/∂H - Hazard intensity sensitivity (rate-weighted)
                 
             grad_vulnerability : tf.Tensor, shape (K, M), dtype float32
-                ∂(AAL)/∂C - Vulnerability curve sensitivity
+                ∂(AAL)/∂C - Vulnerability curve sensitivity (rate-weighted)
                 
             grad_exposure : tf.Tensor, shape (N,), dtype float32
-                ∂(AAL)/∂v - Exposure sensitivity
+                ∂(AAL)/∂v - Exposure sensitivity (rate-weighted)
+                
+            grad_lambdas : tf.Tensor, shape (Q,), dtype float32
+                ∂(AAL)/∂λ - Scenario occurrence rate sensitivity
                 
             metrics : dict
-                All risk metrics (AAL, variance, etc.)
+                All rate-weighted risk metrics (AAL, variance, etc.)
                 
             loss_matrix : tf.Tensor, shape (N, Q), dtype float32
                 Complete loss matrix J ∈ ℝ^(N×Q)
@@ -800,6 +930,7 @@ class TensorialRiskEngine:
         grad_H = tape.gradient(aal, self.H)
         grad_C = tape.gradient(aal, self.C)
         grad_v = tape.gradient(aal, self.v)
+        grad_lambdas = tape.gradient(aal, self.lambdas)
         
         del tape  # Clean up persistent tape
         
@@ -807,6 +938,7 @@ class TensorialRiskEngine:
             'grad_hazard': grad_H,
             'grad_vulnerability': grad_C,
             'grad_exposure': grad_v,
+            'grad_lambdas': grad_lambdas,
             'metrics': metrics,
             'loss_matrix': J_matrix
         }
