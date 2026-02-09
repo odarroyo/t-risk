@@ -29,7 +29,7 @@ This implementation is based on a rigorous mathematical formulation for differen
 - **Section 3c:** Scenario occurrence rate modeling with non-uniform event catalogs
 - **Section 4:** Gradient computation w.r.t. vulnerability curves (∂AAL/∂C)
 - **Section 5:** Gradient computation w.r.t. exposure values (∂AAL/∂v) and hazard intensities (∂AAL/∂H)
-- **Section 3c:** Gradient computation w.r.t. scenario rates (∂AAL/∂λ)
+- **Section 5:** Gradient computation w.r.t. scenario rates (∂AAL/∂λ)
 
 ## 📁 Repository Structure
 
