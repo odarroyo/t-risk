@@ -48,8 +48,10 @@ def generate_synthetic_portfolio(
     n_assets: int,
     n_events: int,
     n_typologies: int = 5,
-    n_curve_points: int = 20
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    n_curve_points: int = 20,
+    lambdas: Optional[np.ndarray] = None,
+    lambda_distribution: str = 'exponential'
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 ```
 
 #### Parameters
@@ -60,10 +62,12 @@ def generate_synthetic_portfolio(
 | `n_events` | int | - | Number of stochastic event realizations (Q) |
 | `n_typologies` | int | 5 | Number of building typologies/curves (K) |
 | `n_curve_points` | int | 20 | Discretization points for curves (M) |
+| `lambdas` | np.ndarray | None | Pre-specified scenario occurrence rates ∈ ℝ^Q. If None, will be generated |
+| `lambda_distribution` | str | 'exponential' | Distribution for generated lambdas: 'uniform' or 'exponential' |
 
 #### Returns
 
-Returns a tuple of 5 NumPy arrays:
+Returns a tuple of 6 NumPy arrays:
 
 1. **v** `(N,) float32` - Exposure vector ∈ ℝ^N  
    Replacement costs ranging from $100,000 to $1,000,000
@@ -80,23 +84,38 @@ Returns a tuple of 5 NumPy arrays:
 5. **H** `(N, Q) float32` - Hazard intensity matrix ∈ ℝ^(N×Q)  
    Ground motion intensities for each asset in each event
 
+6. **lambdas** `(Q,) float32` - Scenario occurrence rate vector ∈ ℝ^Q  
+   λ_q = annual occurrence rate of event q (events/year)
+
 #### Example
 
 ```python
 # Generate portfolio with 1000 assets, 5000 events
-v, u, C, x_grid, H = generate_synthetic_portfolio(
+v, u, C, x_grid, H, lambdas = generate_synthetic_portfolio(
     n_assets=1000,
     n_events=5000,
     n_typologies=5,
-    n_curve_points=20
+    n_curve_points=20,
+    lambda_distribution='exponential'
 )
 
 print(f"Portfolio has {len(v)} assets")
 print(f"Using {C.shape[0]} vulnerability curves")
 print(f"Analyzing {H.shape[1]} stochastic events")
+print(f"Total occurrence rate: {lambdas.sum():.4f} events/year")
 ```
 
 #### Notes
+
+- Uses sigmoid functions to generate realistic vulnerability curves
+- Different typologies have varying fragility (steepness) and thresholds
+- Hazard intensities are uniformly distributed for demonstration purposes
+- **Exponential distribution** for lambdas mimics importance sampling typical in CAT modeling
+  - Higher rates for more frequent (lower intensity) events
+  - Lower rates for rare (higher intensity) events
+  - Normalized so sum equals 1.0 (interpretable as probabilities)
+- **Uniform distribution** for lambdas sets λ_q = 1/Q for all events
+- Fixed random seed (42) ensures reproducible results
 
 - Uses fixed random seed (42) for reproducibility
 - Vulnerability curves modeled as sigmoid functions
@@ -252,22 +271,25 @@ Derive comprehensive risk metrics from the loss matrix.
 ```python
 @tf.function
 def compute_risk_metrics(
-    J_matrix: tf.Tensor
+    J_matrix: tf.Tensor,
+    lambdas: Optional[tf.Tensor] = None
 ) -> Dict[str, tf.Tensor]
 ```
 
 #### Mathematical Formulation
 
-Implements Manuscript Section 3, Equations 5-6:
+Implements Manuscript Section 3c with rate-weighted formulation:
 
-- **AAL per asset:** AAL_i = (1/Q) Σ_q J[i,q]
-- **Variance:** σ²_i = (1/Q) Σ_q (J[i,q] - AAL_i)²
+- **Rate-weighted AAL per asset:** AAL_i = Σ_q λ_q × J[i,q]
+- **Mean per event:** μ_i = AAL_i / Λ, where Λ = Σ_q λ_q
+- **Rate-weighted variance:** σ²_i = Σ_q w_q × (J[i,q] - μ_i)², where w_q = λ_q / Λ
 
 #### Parameters
 
 | Parameter | Shape | Type | Description |
 |-----------|-------|------|-------------|
 | `J_matrix` | (N, Q) | float32 | Loss matrix |
+| `lambdas` | (Q,) | float32 | Scenario occurrence rates (optional, defaults to uniform 1/Q) |
 
 #### Returns
 
@@ -275,20 +297,24 @@ Dictionary containing:
 
 | Key | Shape | Type | Description |
 |-----|-------|------|-------------|
-| `aal_per_asset` | (N,) | float32 | Average Annual Loss per asset |
+| `aal_per_asset` | (N,) | float32 | Rate-weighted Average Annual Loss per asset |
 | `aal_portfolio` | scalar | float32 | Total portfolio AAL |
-| `variance_per_asset` | (N,) | float32 | Loss variance per asset |
+| `mean_per_event_per_asset` | (N,) | float32 | Mean loss per event occurrence per asset |
+| `variance_per_asset` | (N,) | float32 | Rate-weighted loss variance per asset |
 | `std_per_asset` | (N,) | float32 | Loss standard deviation per asset |
 | `loss_per_event` | (Q,) | float32 | Total loss per event |
+| `total_rate` | scalar | float32 | Total occurrence rate Λ = Σ_q λ_q |
 
 #### Example
 
 ```python
-# Compute metrics
-metrics = compute_risk_metrics(J_matrix)
+# Compute metrics with scenario rates
+lambdas = tf.constant([0.5, 0.3, 0.2], dtype=tf.float32)  # Non-uniform rates
+metrics = compute_risk_metrics(J_matrix, lambdas)
 
 # Access results
 print(f"Portfolio AAL: ${metrics['aal_portfolio'].numpy():,.2f}")
+print(f"Total rate: {metrics['total_rate'].numpy():.4f} events/year")
 print(f"Riskiest asset AAL: ${metrics['aal_per_asset'].numpy().max():,.2f}")
 print(f"Average volatility: ${metrics['std_per_asset'].numpy().mean():,.2f}")
 
@@ -320,13 +346,23 @@ class TensorialRiskEngine:
         u: np.ndarray,
         C: np.ndarray,
         x_grid: np.ndarray,
-        H: np.ndarray
+        H: np.ndarray,
+        lambdas: Optional[np.ndarray] = None
     )
 ```
 
 #### Parameters
 
 All parameters are NumPy arrays with the same specifications as `generate_synthetic_portfolio()` returns.
+
+| Parameter | Shape | Type | Description |
+|-----------|-------|------|-------------|
+| `v` | (N,) | float32 | Exposure vector (replacement costs) |
+| `u` | (N,) | int32 | Typology index vector |
+| `C` | (K, M) | float32 | Vulnerability matrix |
+| `x_grid` | (M,) | float32 | Intensity grid vector |
+| `H` | (N, Q) | float32 | Hazard intensity matrix |
+| `lambdas` | (Q,) | float32 | Scenario occurrence rates (optional, defaults to uniform 1/Q) |
 
 #### Attributes
 
@@ -339,6 +375,7 @@ After initialization, the engine contains:
 | `C` | tf.Variable | (K, M) | Vulnerability (differentiable) |
 | `x_grid` | tf.Constant | (M,) | Intensity grid (not differentiable) |
 | `H` | tf.Variable | (N, Q) | Hazard (differentiable) |
+| `lambdas` | tf.Variable | (Q,) | Scenario occurrence rates (differentiable) |
 | `n_assets` | int | - | Number of assets |
 | `n_events` | int | - | Number of events |
 | `n_typologies` | int | - | Number of typologies |
@@ -361,11 +398,12 @@ def compute_loss_and_metrics(self) -> Tuple[tf.Tensor, Dict]
 #### Example
 
 ```python
-engine = TensorialRiskEngine(v, u, C, x_grid, H)
+engine = TensorialRiskEngine(v, u, C, x_grid, H, lambdas)
 J_matrix, metrics = engine.compute_loss_and_metrics()
 
 print(f"Computed {J_matrix.shape[0] * J_matrix.shape[1]:,} loss values")
 print(f"Portfolio AAL: ${metrics['aal_portfolio'].numpy():,.2f}")
+print(f"Total rate: {metrics['total_rate'].numpy():.4f} events/year")
 ```
 
 ---
@@ -522,9 +560,64 @@ grad_per_event = tape.gradient(aal, event_aal)
 
 ---
 
+### Method: `gradient_wrt_lambdas()`
+
+Compute gradient ∂(AAL)/∂λ for scenario occurrence rate sensitivity analysis.
+
+```python
+def gradient_wrt_lambdas(self) -> Tuple[tf.Tensor, Dict]
+```
+
+#### Returns
+
+- **grad_lambdas:** `(Q,)` tensor - Scenario rate gradient
+- **metrics:** dict - Current risk metrics
+
+#### Interpretation
+
+- **grad_lambdas[q]:** Change in AAL per unit change in occurrence rate λ_q
+- **Units:** $ (dollars, total portfolio loss for event q)
+- **Large values:** Scenarios that contribute most to portfolio AAL
+- **Always positive:** Increasing any event rate increases AAL
+
+#### Example
+
+```python
+grad_lambdas, metrics = engine.gradient_wrt_lambdas()
+
+# Find most critical scenarios
+critical_events = tf.argsort(grad_lambdas, direction='DESCENDING')[:10].numpy()
+
+print("Top 10 most critical scenarios:")
+for rank, event_idx in enumerate(critical_events, 1):
+    print(f"{rank}. Event {event_idx}:")
+    print(f"   ∂AAL/∂λ = ${grad_lambdas[event_idx].numpy():,.2f}")
+    print(f"   Current rate: {lambdas[event_idx]:.6f} events/year")
+    print(f"   Contribution to AAL: ${(grad_lambdas[event_idx] * lambdas[event_idx]).numpy():,.2f}")
+
+# Analyze scenario importance distribution
+total_gradient = tf.reduce_sum(grad_lambdas).numpy()
+print(f"\nTotal gradient magnitude: ${total_gradient:,.2f}")
+print(f"Average per scenario: ${total_gradient / len(grad_lambdas):,.2f}")
+```
+
+#### Applications
+
+- **Event catalog analysis:** Identify which scenarios drive portfolio risk
+- **Importance sampling:** Optimize event set weights for Monte Carlo
+- **Catalog completeness:** Assess sensitivity to missing rare events
+- **Event set optimization:** Guide catalog refinement and pruning decisions
+- **Return period analysis:** Understand contribution by frequency band
+
+#### Mathematical Note
+
+The gradient is straightforward: ∂(∑_q λ_q × L_q)/∂λ_q = L_q, where L_q is the total portfolio loss in event q. However, this gradient provides crucial insight into which scenarios dominate the risk profile.
+
+---
+
 ### Method: `full_gradient_analysis()`
 
-Compute complete gradient ∇J = [∂J/∂H, ∂J/∂C, ∂J/∂v] in single pass.
+Compute complete gradient ∇J = [∂J/∂H, ∂J/∂C, ∂J/∂v, ∂J/∂λ] in single pass.
 
 ```python
 def full_gradient_analysis(self) -> Dict
@@ -539,6 +632,7 @@ Dictionary containing:
 | `grad_hazard` | (N, Q) | float32 | ∂(AAL)/∂H |
 | `grad_vulnerability` | (K, M) | float32 | ∂(AAL)/∂C |
 | `grad_exposure` | (N,) | float32 | ∂(AAL)/∂v |
+| `grad_lambdas` | (Q,) | float32 | ∂(AAL)/∂λ |
 | `metrics` | dict | - | All risk metrics |
 | `loss_matrix` | (N, Q) | float32 | Complete loss matrix |
 
@@ -552,6 +646,7 @@ analysis = engine.full_gradient_analysis()
 grad_H = analysis['grad_hazard']
 grad_C = analysis['grad_vulnerability']
 grad_v = analysis['grad_exposure']
+grad_lambdas = analysis['grad_lambdas']
 
 # Analyze each component
 print("="*60)
@@ -574,13 +669,19 @@ for i in exp_top5:
 hazard_sens = tf.reduce_mean(tf.abs(grad_H)).numpy()
 print(f"\nAverage hazard sensitivity: ${hazard_sens:.2e}/g")
 
+# Scenario rate sensitivity
+top_scenarios = tf.argsort(grad_lambdas, direction='DESCENDING')[:3].numpy()
+print(f"\nTop 3 critical scenarios:")
+for event_idx in top_scenarios:
+    print(f"  Event {event_idx}: ∂AAL/∂λ = ${grad_lambdas[event_idx].numpy():,.2f}")
+
 # Portfolio metrics
 print(f"\nPortfolio AAL: ${analysis['metrics']['aal_portfolio'].numpy():,.2f}")
 ```
 
 #### Efficiency Note
 
-This method uses a persistent `GradientTape`, which is more efficient than calling the three gradient methods separately because:
+This method uses a persistent `GradientTape`, which is more efficient than calling the four gradient methods separately because:
 - Single forward pass through the computation graph
 - All gradients computed from same activations
 - Reduced memory allocation/deallocation
@@ -598,16 +699,17 @@ from tensor_engine import generate_synthetic_portfolio, TensorialRiskEngine
 
 # 1. Generate portfolio data
 print("Generating portfolio...")
-v, u, C, x_grid, H = generate_synthetic_portfolio(
+v, u, C, x_grid, H, lambdas = generate_synthetic_portfolio(
     n_assets=1000,
     n_events=5000,
     n_typologies=5,
-    n_curve_points=20
+    n_curve_points=20,
+    lambda_distribution='exponential'
 )
 
 # 2. Initialize engine
 print("Initializing engine...")
-engine = TensorialRiskEngine(v, u, C, x_grid, H)
+engine = TensorialRiskEngine(v, u, C, x_grid, H, lambdas)
 
 # 3. Compute base metrics
 print("Computing risk metrics...")
