@@ -40,7 +40,7 @@ Tensor_Risk_Engine/
 ├── examples/
 │   ├── demonstration.py           # Complete demonstration of all features
 │   ├── minimum_example_deterministic.py  # Minimal example for validation
-│   └── hand_calculation_deterministic.ipynb  # Step-by-step manual calculations
+│   └── minimum_example_manuscript_stochastic_exponential_lambda.py  # Example of a stochastic scenario with ocurrence rates for different scenarios
 ├── API_DOCUMENTATION.md           # Detailed API reference
 ├── README_IMPLEMENTATION.md       # Implementation details and manuscript compliance
 ├── MINIMUM_EXAMPLE_README.md      # Guide for minimal examples
