@@ -23,11 +23,14 @@ import tensorflow as tf
 from tensor_engine import TensorialRiskEngine
 from utils.data_loader import (
     load_assets_file, load_vulnerability_file, load_hazard_file, 
-    load_lambdas_file, generate_synthetic_data,
-    generate_assets_template, generate_vulnerability_template,
+    load_lambdas_file, generate_synthetic_data, generate_synthetic_data_advanced,
+    get_portfolio_preset, generate_assets_template, generate_vulnerability_template,
     generate_hazard_template, generate_lambdas_template
 )
-from utils.validators import validate_all, estimate_memory_usage
+from utils.validators import (
+    validate_all, estimate_memory_usage, validate_asset_categories, 
+    validate_intensity_ranges
+)
 from utils.visualizations import *
 from utils.persistence import save_analysis, load_analysis, validate_loaded_data, create_metadata
 
@@ -194,34 +197,318 @@ with tab1:
     if data_option == "🎲 Generate Synthetic Data":
         st.markdown("### Synthetic Portfolio Generator")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            N = st.slider("Number of Assets (N)", 100, 10000, 1000, 100)
-            Q = st.slider("Number of Events (Q)", 100, 100000, 5000, 100)
-        
-        with col2:
-            K = st.slider("Number of Typologies (K)", 3, 10, 5, 1)
-            M = st.slider("Curve Points (M)", 10, 50, 20, 5)
-        
-        lambda_dist = st.selectbox(
-            "Lambda Distribution",
-            ["uniform", "exponential"],
-            help="Uniform: equal rates for all events. Exponential: realistic seismic recurrence."
+        # Mode selector
+        gen_mode = st.radio(
+            "Generation Mode",
+            ["🎯 Simple (Random)", "🏙️ Advanced (City-Representative)"],
+            help="Simple: fully random portfolio. Advanced: control asset categories and hazard ranges."
         )
         
-        # Memory estimate
-        mem_est = estimate_memory_usage(N, Q, K, M)
-        st.info(f"💾 Estimated memory usage: {mem_est}")
+        if gen_mode == "🎯 Simple (Random)":
+            # Simple mode - original behavior
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                N = st.slider("Number of Assets (N)", 100, 10000, 1000, 100)
+                Q = st.slider("Number of Events (Q)", 100, 100000, 5000, 100)
+            
+            with col2:
+                K = st.slider("Number of Typologies (K)", 3, 10, 5, 1)
+                M = st.slider("Curve Points (M)", 10, 50, 20, 5)
+            
+            lambda_dist = st.selectbox(
+                "Lambda Distribution",
+                ["uniform", "exponential"],
+                help="Uniform: equal rates for all events. Exponential: realistic seismic recurrence."
+            )
+            
+            # Memory estimate
+            mem_est = estimate_memory_usage(N, Q, K, M)
+            st.info(f"💾 Estimated memory usage: {mem_est}")
+            
+            if st.button("🎲 Generate Simple Portfolio", type="primary", use_container_width=True):
+                with st.spinner("Generating synthetic data..."):
+                    synthetic_data = generate_synthetic_data(N, Q, K, M, lambda_dist)
+                    st.session_state.inputs = synthetic_data
+                    st.session_state.data_source = 'synthetic'
+                    st.session_state.lambda_mode = lambda_dist
+                    st.session_state.uploaded_filenames = {}
+                    st.success(f"✓ Generated portfolio: {N} assets, {Q} events, {K} typologies")
         
-        if st.button("🎲 Generate Synthetic Portfolio", type="primary", use_container_width=True):
-            with st.spinner("Generating synthetic data..."):
-                synthetic_data = generate_synthetic_data(N, Q, K, M, lambda_dist)
-                st.session_state.inputs = synthetic_data
-                st.session_state.data_source = 'synthetic'
-                st.session_state.lambda_mode = lambda_dist
-                st.session_state.uploaded_filenames = {}
-                st.success(f"✓ Generated portfolio: {N} assets, {Q} events, {K} typologies")
+        else:
+            # Advanced mode - category-based generation
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                N = st.slider("Number of Assets (N)", 100, 10000, 1000, 100, key='adv_n')
+                Q = st.slider("Number of Events (Q)", 100, 100000, 5000, 100, key='adv_q')
+            
+            with col2:
+                K = st.slider("Number of Typologies (K)", 3, 10, 5, 1, key='adv_k')
+                M = st.slider("Curve Points (M)", 10, 50, 20, 5, key='adv_m')
+            
+            # Preset selector
+            st.markdown("#### 📋 Portfolio Template")
+            preset_name = st.selectbox(
+                "Choose Preset or Customize",
+                ["Residential City", "High-Risk Zone", "Commercial District", "Custom"],
+                help="Select a preset or choose Custom to define your own categories"
+            )
+            
+            # Initialize categories from preset or session state
+            if preset_name != "Custom":
+                preset_config = get_portfolio_preset(preset_name)
+                categories = preset_config['categories']
+                intensity_ranges = preset_config['intensity_ranges']
+                rp_min, rp_max = preset_config['rp_min'], preset_config['rp_max']
+                rp_spacing = preset_config.get('rp_spacing', 'exponential')
+            else:
+                # Custom mode - use session state or defaults
+                if 'custom_categories' not in st.session_state:
+                    st.session_state.custom_categories = [
+                        {'name': 'Category 1', 'percentage': 100, 'cost_min': 100, 'cost_max': 500, 'typology': 'random'}
+                    ]
+                categories = st.session_state.custom_categories
+                rp_min, rp_max = 32.0, 5000.0
+                rp_spacing = 'exponential'
+                intensity_ranges = {
+                    'min_intensity_frequent': 0.02,
+                    'max_intensity_frequent': 0.06,
+                    'min_intensity_rare': 0.85,
+                    'max_intensity_rare': 0.95
+                }
+            
+            # Asset categories section
+            with st.expander("📊 Asset Categories", expanded=(preset_name == "Custom")):
+                if preset_name == "Custom":
+                    # Add/remove category buttons
+                    col_btn1, col_btn2 = st.columns(2)
+                    with col_btn1:
+                        if st.button("➕ Add Category") and len(categories) < 5:
+                            categories.append({
+                                'name': f'Category {len(categories)+1}',
+                                'percentage': 0,
+                                'cost_min': 100,
+                                'cost_max': 500,
+                                'typology': 'random'
+                            })
+                            st.session_state.custom_categories = categories
+                            st.rerun()
+                    
+                    with col_btn2:
+                        if st.button("➖ Remove Last") and len(categories) > 1:
+                            categories.pop()
+                            st.session_state.custom_categories = categories
+                            st.rerun()
+                    
+                    st.markdown("---")
+                
+                # Display/edit categories
+                edited_categories = []
+                for i, cat in enumerate(categories):
+                    st.markdown(f"**{cat['name']}**")
+                    cat_col1, cat_col2, cat_col3 = st.columns(3)
+                    
+                    with cat_col1:
+                        pct = st.slider(
+                            "Percentage (%)",
+                            0, 100, cat['percentage'],
+                            key=f"cat_{i}_pct",
+                            disabled=(preset_name != "Custom")
+                        )
+                    
+                    with cat_col2:
+                        cost_min = st.number_input(
+                            "Min Cost ($k)",
+                            min_value=1, max_value=10000, value=cat['cost_min'],
+                            key=f"cat_{i}_min",
+                            disabled=(preset_name != "Custom")
+                        )
+                    
+                    with cat_col3:
+                        cost_max = st.number_input(
+                            "Max Cost ($k)",
+                            min_value=1, max_value=10000, value=cat['cost_max'],
+                            key=f"cat_{i}_max",
+                            disabled=(preset_name != "Custom")
+                        )
+                    
+                    # Typology selector
+                    typology_options = ['random'] + list(range(K))
+                    typology_display = ['Random'] + [f'Type {k}' for k in range(K)]
+                    
+                    if isinstance(cat['typology'], list):
+                        default_typ_idx = 0  # Random
+                    elif cat['typology'] == 'random':
+                        default_typ_idx = 0
+                    else:
+                        default_typ_idx = cat['typology'] + 1
+                    
+                    typology = st.selectbox(
+                        "Typology",
+                        typology_display,
+                        index=default_typ_idx,
+                        key=f"cat_{i}_typ",
+                        disabled=(preset_name != "Custom")
+                    )
+                    
+                    # Convert typology back to proper format
+                    if typology == 'Random':
+                        typ_value = 'random'
+                    else:
+                        typ_value = int(typology.split()[1])
+                    
+                    edited_categories.append({
+                        'name': cat['name'],
+                        'percentage': pct,
+                        'cost_min': cost_min,
+                        'cost_max': cost_max,
+                        'typology': typ_value
+                    })
+                    
+                    if i < len(categories) - 1:
+                        st.markdown("---")
+                
+                if preset_name == "Custom":
+                    st.session_state.custom_categories = edited_categories
+                
+                categories = edited_categories
+                
+                # Show total percentage
+                total_pct = sum(cat['percentage'] for cat in categories)
+                if abs(total_pct - 100) < 1:
+                    st.success(f"✓ Total: {total_pct}%")
+                else:
+                    st.warning(f"⚠️ Total: {total_pct}% (must be 100%)")
+            
+            # Hazard intensity ranges section
+            with st.expander("🌍 Hazard Intensity Ranges", expanded=False):
+                st.markdown("**Return Period Range**")
+                col_rp1, col_rp2 = st.columns(2)
+                with col_rp1:
+                    rp_min = st.number_input("Min RP (years)", min_value=1.0, max_value=10000.0, 
+                                             value=rp_min, key='rp_min')
+                with col_rp2:
+                    rp_max = st.number_input("Max RP (years)", min_value=1.0, max_value=10000.0, 
+                                             value=rp_max, key='rp_max')
+                
+                st.markdown("**Return Period Spacing**")
+                rp_spacing = st.radio(
+                    "Spacing Mode",
+                    ["exponential", "linear"],
+                    index=0 if rp_spacing == 'exponential' else 1,
+                    horizontal=True,
+                    help="**Exponential** (realistic): Many frequent events, few rare events. " +
+                         "Creates higher total rates (Λ). Use for realistic seismic catalogs.\n\n" +
+                         "**Linear** (teaching): Events uniformly distributed across RP range. " +
+                         "Creates lower total rates. Use for educational exploration.",
+                    key='rp_spacing'
+                )
+                
+                st.markdown("**Frequent Events (Low RP)**")
+                col_f1, col_f2 = st.columns(2)
+                with col_f1:
+                    min_int_freq = st.number_input("Min Intensity (g)", min_value=0.0, max_value=2.0, 
+                                                   value=intensity_ranges['min_intensity_frequent'], 
+                                                   step=0.01, format="%.3f", key='min_int_freq')
+                with col_f2:
+                    max_int_freq = st.number_input("Max Intensity (g)", min_value=0.0, max_value=2.0, 
+                                                   value=intensity_ranges['max_intensity_frequent'],
+                                                   step=0.01, format="%.3f", key='max_int_freq')
+                
+                st.markdown("**Rare Events (High RP)**")
+                col_r1, col_r2 = st.columns(2)
+                with col_r1:
+                    min_int_rare = st.number_input("Min Intensity (g)", min_value=0.0, max_value=2.0, 
+                                                   value=intensity_ranges['min_intensity_rare'],
+                                                   step=0.01, format="%.3f", key='min_int_rare')
+                with col_r2:
+                    max_int_rare = st.number_input("Max Intensity (g)", min_value=0.0, max_value=2.0, 
+                                                   value=intensity_ranges['max_intensity_rare'],
+                                                   step=0.01, format="%.3f", key='max_int_rare')
+                
+                st.info("💡 Realistic: Frequent events have low intensities, rare events have high intensities")
+            
+            # Memory estimate
+            mem_est = estimate_memory_usage(N, Q, K, M)
+            st.info(f"💾 Estimated memory usage: {mem_est}")
+            
+            # Validation and generation
+            if st.button("🏙️ Generate City-Representative Portfolio", type="primary", use_container_width=True):
+                # Validate categories
+                valid_cat, msg_cat = validate_asset_categories(categories, K)
+                if not valid_cat:
+                    st.error(msg_cat)
+                else:
+                    # Validate intensity ranges
+                    valid_int, msg_int = validate_intensity_ranges(
+                        min_int_freq, max_int_freq, min_int_rare, max_int_rare
+                    )
+                    if not valid_int:
+                        st.error(msg_int)
+                    else:
+                        with st.spinner("Generating city-representative portfolio..."):
+                            synthetic_data = generate_synthetic_data_advanced(
+                                N=N, Q=Q, K=K, M=M,
+                                asset_categories=categories,
+                                rp_min=rp_min,
+                                rp_max=rp_max,
+                                rp_spacing=rp_spacing,
+                                min_intensity_frequent=min_int_freq,
+                                max_intensity_frequent=max_int_freq,
+                                min_intensity_rare=min_int_rare,
+                                max_intensity_rare=max_int_rare
+                            )
+                            st.session_state.inputs = synthetic_data
+                            st.session_state.data_source = 'synthetic_advanced'
+                            st.session_state.lambda_mode = rp_spacing
+                            st.session_state.uploaded_filenames = {}
+                            st.session_state.portfolio_config = {
+                                'categories': categories,
+                                'rp_min': rp_min,
+                                'rp_max': rp_max,
+                                'rp_spacing': rp_spacing,
+                                'intensity_ranges': {
+                                    'min_intensity_frequent': min_int_freq,
+                                    'max_intensity_frequent': max_int_freq,
+                                    'min_intensity_rare': min_int_rare,
+                                    'max_intensity_rare': max_int_rare
+                                }
+                            }
+                            st.success(f"✓ Generated city-representative portfolio: {N} assets, {Q} events")
+                            st.info(f"✓ {len(categories)} asset categories with RP-dependent intensities")
+                            
+                            # Display total rate with educational context
+                            total_rate = synthetic_data['total_rate']
+                            avg_inter_event = 1.0 / total_rate if total_rate > 0 else float('inf')
+                            
+                            if total_rate < 0.3:
+                                st.success(f"📊 Total Rate (Λ): {total_rate:.4f} - One event every {avg_inter_event:.1f} years (realistic seismicity)")
+                            elif total_rate < 1.0:
+                                st.warning(f"📊 Total Rate (Λ): {total_rate:.4f} - One event every {avg_inter_event:.1f} years (high seismicity)")
+                            else:
+                                st.error(f"📊 Total Rate (Λ): {total_rate:.4f} - {total_rate:.1f} events per year (unrealistic - AAL may exceed portfolio value!)")
+                            
+                            # Educational comparison
+                            with st.expander("ℹ️ Understanding Total Rate (Λ)"):
+                                st.markdown(f"""
+                                **Current Configuration:**
+                                - RP Range: [{rp_min:.0f}, {rp_max:.0f}] years
+                                - Spacing: {rp_spacing.upper()}
+                                - Total Rate Λ = Σλ = {total_rate:.4f}
+                                - Average Inter-Event Time: {avg_inter_event:.1f} years
+                                
+                                **Interpretation:**
+                                - Λ < 0.3: Realistic for most seismic regions (event every 3+ years)
+                                - Λ ≈ 0.5: High seismicity zone (event every 2 years)
+                                - Λ ≈ 1.0: Extreme seismicity (one event per year)
+                                - Λ > 1.0: Unrealistic (multiple events yearly, AAL > exposure)
+                                
+                                **Teaching Note:**
+                                Exponential spacing creates denser event clusters at low RP values 
+                                (realistic), while linear spacing distributes events uniformly 
+                                (better for exploring parameter sensitivity).
+                                """)
     
     elif data_option == "📤 Upload CSV/XLSX Files":
         st.markdown("### Template Downloads")

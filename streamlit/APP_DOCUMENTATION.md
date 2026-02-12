@@ -222,10 +222,13 @@ asset_id,exposure,typology,latitude,longitude,description
    - Proceed to Inputs tab
 
 2. **🎲 Generate Synthetic Data**
+   - **Two modes available:**
+     - **🎯 Simple Mode**: Random portfolios with uniform/exponential lambda distributions
+     - **🏙️ Advanced Mode**: City-representative portfolios with category-based structure
    - Sliders for N, Q, K, M
-   - Choose lambda distribution
    - Memory estimate shown
    - Instant generation
+   - New: Total Rate (Λ) display with interpretation
 
 3. **📂 Load Saved Analysis**
    - Upload previous ZIP
@@ -676,17 +679,201 @@ event_id,lambda_per_year,return_period_years,magnitude,description
 
 ---
 
+## Synthetic Portfolio Generation
+
+The application offers **two modes** for generating synthetic portfolios, each serving different purposes:
+
+### Mode 1: 🎯 Simple (Random Portfolios)
+
+**Purpose:** Quick exploration and testing with fully randomized data
+
+**Configuration:**
+- **Portfolio Size:** N assets, Q events, K typologies, M curve points
+- **Lambda Distribution:** 
+  - Uniform: Equal probability for all events
+  - Exponential: Realistic decay (frequent → rare events)
+
+**Generation Process:**
+1. Random exposure values: Uniform distribution [100k, 500k]
+2. Random typology assignments: 0 to K-1
+3. Sigmoid vulnerability curves: Steepness and midpoint vary by typology
+4. Random hazard intensities: Uniform [0, 1.5g]
+5. Lambda rates: Based on selected distribution
+
+**Use Cases:**
+- Quick testing and prototyping
+- Algorithm verification
+- Performance benchmarking
+- Teaching basic concepts
+
+**Limitations:**
+- No realistic portfolio structure
+- Random exposure/vulnerability relationships
+- May not represent real-world scenarios
+
+---
+
+### Mode 2: 🏙️ Advanced (City-Representative Portfolios)
+
+**Purpose:** Realistic portfolios with category-based structure and RP-dependent intensities
+
+**Key Features:**
+
+1. **Asset Categories**
+   - Define 1-5 categories (e.g., "Low-Value Homes", "Old Vulnerable", "Modern Protected")
+   - Control percentage distribution across portfolio
+   - Set cost ranges (min/max) per category
+   - Assign typologies (specific, random, or list)
+
+2. **Return Period (RP) Spacing Modes**
+   
+   **Exponential Spacing** (Realistic):
+   - Mimics actual seismic catalogs
+   - Many frequent events (low RP), few rare events (high RP)
+   - Creates higher total rates (Λ) due to clustering at low RP
+   - Formula: `RP = exp(linspace(log(rp_min), log(rp_max), Q))`
+   - **Caution:** Can produce Λ > 1.0 with narrow RP ranges or many events
+   
+   **Linear Spacing** (Educational):
+   - Events uniformly distributed across RP range
+   - Equal spacing between consecutive return periods
+   - Creates lower total rates (Λ)
+   - Formula: `RP = linspace(rp_min, rp_max, Q)`
+   - **Best for:** Teaching, parameter exploration, avoiding unrealistic total rates
+
+3. **RP-Dependent Intensity Coupling**
+   - **Frequent events** (low RP): Low intensity range (e.g., 0.02-0.06g)
+   - **Rare events** (high RP): High intensity range (e.g., 0.85-0.95g)
+   - **Inverse relationship:** Higher occurrence rate → lower intensity
+   - Realistic seismic behavior
+
+**Total Rate (Λ) Interpretation:**
+
+The total rate Λ = Σλ represents **expected number of damaging events per year**:
+
+- **Λ < 0.3** 🟢: Realistic (one event every 3+ years)
+- **0.3 ≤ Λ < 1.0** 🟡: High seismicity (one event every 1-3 years)
+- **Λ ≥ 1.0** 🔴: Unrealistic (multiple events yearly, AAL may exceed portfolio value!)
+
+**Guidelines for Realistic Λ:**
+- Use **linear spacing** for most configurations, OR
+- Use **exponential spacing** with wider RP ranges (e.g., 50-10000 years), OR
+- Reduce number of events Q, OR
+- Increase minimum return period
+
+**Preset Templates:**
+
+1. **Residential City**
+   - 60% Low-Value Homes ($50k-$300k, typology 1-2)
+   - 30% Mid-Value Homes ($300k-$800k, typology 2-3)
+   - 10% High-Value Homes ($800k-$2M, typology 4)
+   - RP: 32-5000 years, exponential spacing
+   - Intensities: Frequent 0.02-0.06g, Rare 0.85-0.95g
+
+2. **High-Risk Zone**
+   - 70% Standard Homes ($100k-$200k, random typology)
+   - 10% Old Vulnerable ($500k-$600k, typology 0 - weakest)
+   - 20% Modern Protected ($400k-$500k, typology 4 - strongest)
+   - RP: 32-5000 years, exponential spacing
+   - Intensities: Frequent 0.02-0.06g, Rare 0.85-0.95g
+   - **Demonstrates:** Risk concentration in vulnerable subportfolio
+
+3. **Commercial District**
+   - 40% Retail ($200k-$500k, typology 2)
+   - 30% Office Buildings ($500k-$1.5M, typology 3)
+   - 30% Mixed-Use ($300k-$800k, typology 2-3)
+   - RP: 32-5000 years, exponential spacing
+   - Intensities: Frequent 0.02-0.06g, Rare 0.75-0.90g
+
+**Custom Categories:**
+
+Create your own portfolio structure:
+1. Click "Add Category" (up to 5 total)
+2. Set name, percentage, cost range, typology
+3. Ensure percentages sum to 100%
+4. Validation checks automatically
+
+**Example Custom Configuration:**
+
+| Category | % | Cost Range | Typology | Purpose |
+|----------|---|------------|----------|---------|
+| Unreinforced Masonry | 20% | $200k-$400k | 0 | High vulnerability |
+| Wood Frame | 50% | $150k-$350k | 2-3 | Moderate |
+| Steel Frame | 30% | $500k-$1M | 4 | Low vulnerability |
+
+**Comparison: Exponential vs Linear Spacing**
+
+Example with N=100, Q=500, RP=[32, 5000] years:
+
+| Spacing | Total Rate Λ | Inter-Event Time | RP < 100yr | RP > 1000yr | Use Case |
+|---------|--------------|------------------|------------|-------------|----------|
+| Exponential | 3.08 | 0.32 years | 368 events | 37 events | Realistic catalogs* |
+| Linear | 0.52 | 1.91 years | 13 events | 245 events | Teaching/exploration |
+
+*Requires wider RP range or fewer events for realistic Λ
+
+**Educational Use:**
+
+The dual-mode system is designed for teaching catastrophe modeling:
+
+1. **Demonstrate RP spacing impact:**
+   - Generate same portfolio with both spacing modes
+   - Compare total rates and AAL values
+   - Show how event clustering affects risk
+
+2. **Explore unrealistic scenarios:**
+   - Intentionally create Λ > 1.0 configurations
+   - Show why AAL exceeds portfolio value
+   - Teach importance of realistic recurrence assumptions
+
+3. **Category-based risk concentration:**
+   - Use "High-Risk Zone" preset
+   - Show how 10% of assets can drive 40%+ of AAL
+   - Demonstrate gradient-based asset prioritization
+
+---
+
 ## Analysis Workflow
 
-### Workflow 1: Exploration (Synthetic Data)
+### Workflow 1: Exploration (Synthetic Data - Simple Mode)
 
 **Goal:** Understand engine capabilities without data preparation
 
-1. **Setup** → Generate Synthetic Data
+1. **Setup** → Generate Synthetic Data → **Simple Mode**
    - N = 1000, Q = 5000, K = 5, M = 20
    - Lambda = exponential
    
 2. **Run Analysis** → Enable gradients → Run
+
+3. **Dashboard** → Explore all visualizations
+   - Note portfolio AAL
+   - Examine top assets
+   - Check event loss distribution
+
+4. **Gradients** → Try retrofit optimizer
+   - Budget = 10% of total exposure
+   - Effectiveness = 50%
+   - See recommended assets
+
+---
+
+### Workflow 1b: Realistic City Portfolio (Advanced Mode)
+
+**Goal:** Generate realistic city-representative portfolio with category-based structure
+
+1. **Setup** → Generate Synthetic Data → **Advanced Mode**
+   - Choose preset: "Residential City", "High-Risk Zone", or "Commercial District"
+   - Or customize: Define asset categories with percentages, cost ranges, typologies
+   - Configure return period range (e.g., 32-5000 years)
+   - Choose RP spacing: exponential (realistic) or linear (educational)
+   - Set intensity ranges for frequent vs rare events
+   
+2. **Review Total Rate (Λ)**
+   - Green (Λ < 0.3): Realistic seismicity
+   - Yellow (0.3 ≤ Λ < 1.0): High seismicity
+   - Red (Λ ≥ 1.0): Unrealistic - consider linear spacing or wider RP range
+   
+3. **Run Analysis** → Enable gradients → Run
 
 3. **Dashboard** → Explore all visualizations
    - Note portfolio AAL
@@ -1241,6 +1428,118 @@ for datafile in data_files:
 
 Note: Streamlit is designed for interactive use; batch processing may require custom wrapper.
 
+### 5. Best Practices for Synthetic Portfolio Generation
+
+**Choosing Between Simple and Advanced Modes:**
+
+| Scenario | Recommended Mode | Settings |
+|----------|------------------|----------|
+| Quick testing | Simple | N=100, Q=1000, Exponential |
+| Algorithm validation | Simple | Uniform lambda for reproducibility |
+| Teaching basics | Simple | Small N/Q for fast iteration |
+| Realistic city portfolio | Advanced | Use presets, check Λ |
+| Research/publication | Advanced | Custom categories, document Λ |
+| Parameter sensitivity | Advanced | Linear spacing for exploration |
+
+**Managing Total Rate (Λ):**
+
+**Target:** Λ < 1.0 for realistic portfolios
+
+**If Λ > 1.0:**
+
+1. **Switch to linear spacing** (easiest fix)
+   - Reduces Λ by 80-90% typically
+   - Maintains RP range coverage
+   - Good for most applications
+
+2. **Widen RP range** (keep exponential)
+   - Increase `rp_min` (e.g., 32 → 50 years)
+   - Increase `rp_max` (e.g., 5000 → 10000 years)
+   - Spreads events across wider timespan
+
+3. **Reduce number of events**
+   - Lower Q (e.g., 1000 → 500)
+   - Fewer events = lower total rate
+   - May reduce resolution
+
+4. **Accept for educational purposes**
+   - Demonstrate unrealistic scenarios
+   - Show AAL > portfolio value problem
+   - Teach importance of recurrence modeling
+
+**When to Use Each RP Spacing Mode:**
+
+**Exponential Spacing:**
+- Realistic seismic catalog representation
+- Research requiring realism
+- Demonstrating tail risk importance
+- When you need event clustering behavior
+- **Caution:** Monitor Λ closely
+
+**Linear Spacing:**
+- Teaching and exploration
+- Parameter sensitivity studies
+- When you need Λ < 1.0 guaranteed
+- Uniform coverage of RP range
+- Easier interpretation for non-experts
+
+**Category Design Tips:**
+
+1. **Percentages:**
+   - Must sum to exactly 100%
+   - Consider actual city demographics
+   - Example: 60% residential, 30% commercial, 10% industrial
+
+2. **Cost Ranges:**
+   - Non-overlapping is clearer but not required
+   - Use realistic values for region
+   - Consider inflation if comparing across years
+
+3. **Typology Assignment:**
+   - `'random'`: Diverse portfolio within category
+   - Specific value (0-4): Uniform vulnerability
+   - List [1,2,3]: Mix of specific types
+   - Lower index = more vulnerable
+
+4. **Intensity Ranges:**
+   - Frequent events: 0.01-0.10g typical
+   - Rare events: 0.5-1.5g typical
+   - Ensure rare > frequent
+   - Consider local seismic hazard (e.g., Chile vs. UK)
+
+**Educational Workflow - Teaching Seismic Risk:**
+
+**Lesson 1: Event Frequency Impact**
+1. Generate portfolio with exponential spacing, RP=[32, 5000]
+2. Note Λ and AAL
+3. Regenerate with linear spacing, same RP range
+4. Compare Λ (should be ~5× lower)
+5. Compare AAL (should be similar despite different Λ)
+6. **Takeaway:** Event distribution affects total rate but not necessarily AAL
+
+**Lesson 2: Risk Concentration**
+1. Use "High-Risk Zone" preset
+2. Run analysis with gradients
+3. Dashboard → Examine AAL by category
+4. Note: 10% of assets (old vulnerable) drive 40%+ of AAL
+5. Gradients → See high ∂AAL/∂v for vulnerable assets
+6. **Takeaway:** Portfolio composition matters enormously
+
+**Lesson 3: Return Period vs Intensity**
+1. Generate advanced portfolio
+2. Dashboard → Vulnerability curves
+3. Note intensity ranges overlaid
+4. Understand: frequent events hit low-intensity portions of curves
+5. Rare events hit high-intensity (catastrophic) portions
+6. **Takeaway:** RP-intensity coupling is critical for realism
+
+**Common Misconceptions to Address:**
+
+- **"More events = higher AAL"**: False. AAL = Σ(λ × L). More low-λ events may not increase AAL.
+- **"Λ should equal 1.0"**: Only if events are normalized probabilities. Physical interpretation: events/year.
+- **"Exponential spacing is always better"**: Not for teaching or when causing Λ > 1.0.
+- **"All portfolios need 1000+ events"**: Depends on application. 500 often sufficient for teaching.
+
 ---
 
 ## Troubleshooting
@@ -1478,6 +1777,11 @@ load_hazard_file(uploaded_file) -> H
 load_lambdas_file(uploaded_file) -> lambdas
 
 generate_synthetic_data(N, Q, K, M, lambda_mode) -> dict
+generate_synthetic_data_advanced(N, Q, K, M, asset_categories, rp_min, rp_max, 
+                                 rp_spacing, min_intensity_frequent, 
+                                 max_intensity_frequent, min_intensity_rare, 
+                                 max_intensity_rare) -> dict
+get_portfolio_preset(preset_name) -> dict
 generate_assets_template() -> BytesIO
 generate_vulnerability_template() -> BytesIO
 generate_hazard_template() -> BytesIO
@@ -1661,7 +1965,14 @@ where θᵢ are uncertain parameters.
 - **Typology**: Building class with common vulnerability (e.g., "wood frame")
 - **Gradient**: Derivative of AAL w.r.t. parameter (sensitivity)
 - **Occurrence Rate (λ)**: Events per year for a scenario
-- **Return Period**: 1/λ, average time between events
+- **Total Rate (Λ)**: Sum of all occurrence rates (Σλ), expected damaging events per year
+- **Return Period (RP)**: 1/λ, average time between events of a given magnitude
+- **RP Spacing**: Distribution of return periods across event catalog
+  - **Exponential Spacing**: Logarithmic distribution mimicking seismic recurrence (many frequent, few rare)
+  - **Linear Spacing**: Uniform distribution across RP range (equal spacing)
+- **Asset Category**: Portfolio subdivision by characteristics (cost range, typology, location)
+- **City-Representative Portfolio**: Synthetic portfolio with realistic category-based structure
+- **RP-Intensity Coupling**: Inverse relationship where frequent events have low intensity, rare events have high intensity
 - **Stochastic Event**: Simulated scenario from probabilistic catalog
 - **Loss Matrix**: N×Q matrix where J[i,q] = loss of asset i in event q
 - **Exposure**: Replacement cost or insured value of asset
@@ -1673,6 +1984,33 @@ where θᵢ are uncertain parameters.
 
 ## Changelog
 
+### Version 1.1 (February 2026)
+
+**Major Update: Dual-Mode Synthetic Portfolio Generation**
+
+New Features:
+- **Advanced Mode** for city-representative portfolios
+  - Category-based portfolio structure (1-5 asset categories)
+  - Control percentage, cost range, and typology per category
+  - Three preset templates (Residential City, High-Risk Zone, Commercial District)
+- **RP Spacing Modes**: Exponential (realistic) vs Linear (educational)
+- **Total Rate (Λ) Display** with color-coded interpretation
+  - Green (Λ < 0.3): Realistic seismicity
+  - Yellow (0.3 ≤ Λ < 1.0): High seismicity
+  - Red (Λ ≥ 1.0): Unrealistic - AAL may exceed portfolio value
+- **Educational Tooltips** explaining spacing modes and total rate implications
+- **RP-Dependent Intensity Coupling** for realistic seismic behavior
+
+Enhancements:
+- Comprehensive documentation for teaching catastrophe modeling
+- Best practices guide for synthetic portfolio generation
+- Example workflows for educational use
+- Expanded glossary with new concepts
+
+Bug Fixes:
+- Fixed hazard gradient visualization indexing error
+- Improved session state management for advanced mode
+
 ### Version 1.0 (February 2026)
 
 **Initial Release**
@@ -1680,7 +2018,7 @@ where θᵢ are uncertain parameters.
 Features:
 - Complete web interface with 5 tabs
 - Support for CSV/XLSX uploads
-- Synthetic data generator
+- Simple synthetic data generator
 - 15+ interactive Plotly visualizations
 - Full gradient analysis (∂AAL/∂v, ∂AAL/∂C, ∂AAL/∂H, ∂AAL/∂λ)
 - Save/load as ZIP archives
@@ -1695,7 +2033,7 @@ Known Limitations:
 - Single-peril only
 - No spatial correlation
 
-Planned for v1.1:
+Planned for v1.2:
 - Event chunking for Q > 1M
 - Side-by-side comparison mode
 - Multi-peril support
@@ -1717,8 +2055,9 @@ MIT License - See main repository LICENSE file
 
 ---
 
-**Last Updated:** February 9, 2026
+**Last Updated:** February 11, 2026
 
 **Maintained by:** [Your Name/Team]
 
 **Built with:** Streamlit • TensorFlow • Plotly • NumPy
+
