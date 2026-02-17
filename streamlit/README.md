@@ -34,6 +34,10 @@ The app will open in your default browser at `http://localhost:8501`
 
 ## User Guide
 
+Video walkthrough is available at: 
+https://youtu.be/sELH2Gjvyns <img width="468" height="24" alt="image" src="https://github.com/user-attachments/assets/7d874d05-4683-4aa7-8337-d1e3f3af1281" />
+
+
 ### Tab 1: Setup
 
 Choose your data source:
