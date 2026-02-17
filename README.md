@@ -62,14 +62,14 @@ Tensor_Risk_Engine/
 
 ### Core Engine Requirements
 
-- Python 3.8+
+- Python 3.12+
 - TensorFlow 2.10+
 - NumPy
 - Matplotlib
 
 ### Web Application Requirements (Optional)
 
-- Python 3.9+
+- Python 3.12+
 - Streamlit 1.31+
 - Plotly 5.18+
 - Pandas 2.0+
