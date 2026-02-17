@@ -15,7 +15,7 @@ Interactive web interface for the Tensor Risk Engine, providing a user-friendly 
 
 ### Installation
 
-1. Ensure you have Python 3.9+ installed
+1. Ensure you have Python 3.12+ installed
 
 2. Install dependencies:
 ```bash
@@ -34,9 +34,7 @@ The app will open in your default browser at `http://localhost:8501`
 
 ## User Guide
 
-Video walkthrough is available at: 
-https://youtu.be/sELH2Gjvyns
-
+Video walkthrough is available at: https://youtu.be/sELH2Gjvyns
 
 ### Tab 1: Setup
 
