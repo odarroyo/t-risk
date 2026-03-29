@@ -389,7 +389,7 @@ This work reformulates traditional catastrophe risk assessment for modern AI/ML 
 If you use this engine in your research, please cite:
 
 ```bibtex
-[Add citation information when manuscript is published]
+
 ```
 
 ---
