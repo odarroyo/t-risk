@@ -25,10 +25,11 @@ from typing import Tuple, Dict, Optional
 # 1. DATA GENERATION (Manuscript-Compliant)
 # ==========================================
 
-def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int = 5, 
-                                 n_curve_points: int = 20, 
+def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int = 5,
+                                 n_curve_points: int = 20,
                                  lambdas: Optional[np.ndarray] = None,
-                                 lambda_distribution: str = 'exponential') -> Tuple:
+                                 lambda_distribution: str = 'exponential',
+                                 sigma_fraction: Optional[float] = None) -> Tuple:
     """
     Generate synthetic portfolio data matching manuscript notation.
     
@@ -50,7 +51,11 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
         Pre-specified scenario occurrence rates ∈ ℝ^Q. If None, will be generated
     lambda_distribution : str, optional
         Distribution type for generated lambdas: 'uniform' or 'exponential', default is 'exponential'
-    
+    sigma_fraction : float, optional
+        Fraction of maximum Beta std dev to use for vulnerability uncertainty.
+        When provided, generates Sigma = sigma_fraction * sqrt(C * (1 - C)).
+        Typical values: 0.2–0.5. If None, no Sigma is generated.
+
     Returns
     -------
     v_exposure : np.ndarray, shape (N,)
@@ -71,6 +76,8 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
     lambdas_out : np.ndarray, shape (Q,)
         Scenario occurrence rate vector ∈ ℝ^Q
         λ_q = annual occurrence rate of event q (events/year)
+    Sigma_matrix : np.ndarray, shape (K, M) or None
+        Vulnerability std dev matrix ∈ ℝ^(K×M), or None if sigma_fraction not set
     
     Notes
     -----
@@ -82,9 +89,11 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
     
     Examples
     --------
-    >>> v, u, C, x, H, lambdas = generate_synthetic_portfolio(1000, 5000, 5, 20)
+    >>> v, u, C, x, H, lambdas, Sigma = generate_synthetic_portfolio(1000, 5000, 5, 20)
     >>> print(v.shape, u.shape, C.shape, x.shape, H.shape, lambdas.shape)
     (1000,) (1000,) (5, 20) (20,) (1000, 5000) (5000,)
+    >>> print(Sigma)  # None when sigma_fraction not set
+    None
     """
     np.random.seed(42)
     
@@ -128,8 +137,17 @@ def generate_synthetic_portfolio(n_assets: int, n_events: int, n_typologies: int
             raise ValueError(f"Unknown lambda_distribution: {lambda_distribution}")
     else:
         lambdas_out = lambdas.astype(np.float32)
-    
-    return v_exposure, u_typology, C_matrix, x_grid, H_intensities, lambdas_out
+
+    # Vulnerability uncertainty Sigma ∈ ℝ^(K×M)
+    if sigma_fraction is not None:
+        # Sigma = fraction × sqrt(C × (1 - C)), the maximum std dev of a Beta
+        # distribution with mean C. Clamp C away from 0 and 1 for stability.
+        C_clamped = np.clip(C_matrix, 1e-6, 1.0 - 1e-6)
+        Sigma_matrix = (sigma_fraction * np.sqrt(C_clamped * (1.0 - C_clamped))).astype(np.float32)
+    else:
+        Sigma_matrix = None
+
+    return v_exposure, u_typology, C_matrix, x_grid, H_intensities, lambdas_out, Sigma_matrix
 
 # ==========================================
 # 2. DETERMINISTIC FORMULATION (Section 2)
@@ -239,6 +257,65 @@ def deterministic_loss(v: tf.Tensor, u: tf.Tensor, C: tf.Tensor,
 # ==========================================
 
 @tf.function
+def _interpolate_matrix(u: tf.Tensor, Matrix: tf.Tensor,
+                        x_grid: tf.Tensor, H: tf.Tensor) -> tf.Tensor:
+    """
+    Interpolate a (K, M) matrix at hazard intensities for each asset.
+
+    Shared helper that implements the flat-indexing linear interpolation
+    pattern used throughout the engine. For each asset i and event q,
+    looks up Matrix[u[i], :] at intensity H[i,q] via linear interpolation
+    on x_grid.
+
+    Parameters
+    ----------
+    u : tf.Tensor, shape (N,), dtype int32
+        Typology index per asset, values in {0, ..., K-1}.
+    Matrix : tf.Tensor, shape (K, M), dtype float32
+        Any per-typology matrix to interpolate (e.g., C or Sigma).
+    x_grid : tf.Tensor, shape (M,), dtype float32
+        Intensity grid vector.
+    H : tf.Tensor, shape (N, Q), dtype float32
+        Hazard intensity matrix.
+
+    Returns
+    -------
+    result : tf.Tensor, shape (N, Q), dtype float32
+        Interpolated values for each asset-event pair.
+
+    Notes
+    -----
+    Fully differentiable w.r.t. Matrix and H.
+    Uses flat indexing for Metal GPU compatibility.
+    """
+    N = tf.shape(H)[0]
+    Q = tf.shape(H)[1]
+    M = tf.shape(x_grid)[0]
+
+    H_flat = tf.reshape(H, [-1])
+
+    idx = tf.searchsorted(x_grid, H_flat, side='right') - 1
+    idx = tf.clip_by_value(idx, 0, M - 2)
+
+    x_lower = tf.gather(x_grid, idx)
+    x_upper = tf.gather(x_grid, idx + 1)
+    alpha = (H_flat - x_lower) / (x_upper - x_lower + 1e-8)
+
+    u_repeated = tf.tile(tf.expand_dims(u, 1), [1, Q])
+    u_flat = tf.reshape(u_repeated, [-1])
+
+    m_flat = tf.reshape(Matrix, [-1])
+    flat_idx_lower = u_flat * M + idx
+    flat_idx_upper = u_flat * M + (idx + 1)
+
+    m_lower = tf.gather(m_flat, flat_idx_lower)
+    m_upper = tf.gather(m_flat, flat_idx_upper)
+
+    result_flat = (1.0 - alpha) * m_lower + alpha * m_upper
+    return tf.reshape(result_flat, [N, Q])
+
+
+@tf.function
 def probabilistic_loss_matrix(v: tf.Tensor, u: tf.Tensor, C: tf.Tensor,
                                x_grid: tf.Tensor, H: tf.Tensor) -> tf.Tensor:
     """
@@ -307,43 +384,12 @@ def probabilistic_loss_matrix(v: tf.Tensor, u: tf.Tensor, C: tf.Tensor,
     >>> print(J.shape)
     (2, 2)
     """
-    N = tf.shape(H)[0]
-    Q = tf.shape(H)[1]
-    M = tf.shape(x_grid)[0]
-    
-    # Flatten H for vectorized operations
-    H_flat = tf.reshape(H, [-1])
-    
-    # Find grid indices
-    idx = tf.searchsorted(x_grid, H_flat, side='right') - 1
-    idx = tf.clip_by_value(idx, 0, M - 2)
-    
-    # Grid boundaries
-    x_lower = tf.gather(x_grid, idx)
-    x_upper = tf.gather(x_grid, idx + 1)
-    
-    # Interpolation weight α (broadcast for all N×Q combinations)
-    alpha = (H_flat - x_lower) / (x_upper - x_lower + 1e-8)
-    
-    # Repeat typology indices Q times (for all events)
-    u_repeated = tf.tile(tf.expand_dims(u, 1), [1, Q])
-    u_flat = tf.reshape(u_repeated, [-1])
-    
-    # Use flat indexing for Metal GPU compatibility
-    c_flat = tf.reshape(C, [-1])
-    flat_idx_lower = u_flat * M + idx
-    flat_idx_upper = u_flat * M + (idx + 1)
-    
-    c_lower = tf.gather(c_flat, flat_idx_lower)
-    c_upper = tf.gather(c_flat, flat_idx_upper)
-    
-    # Mean Damage Ratio for all (N, Q) combinations
-    mdr_flat = (1.0 - alpha) * c_lower + alpha * c_upper
-    mdr_matrix = tf.reshape(mdr_flat, [N, Q])
-    
+    # Interpolate vulnerability matrix C at hazard intensities
+    mdr_matrix = _interpolate_matrix(u, C, x_grid, H)
+
     # Loss Matrix (Manuscript Eq. 4): J[i,q] = v[i] × MDR[i,q]
     J_matrix = tf.expand_dims(v, 1) * mdr_matrix
-    
+
     return J_matrix
 
 
@@ -464,6 +510,87 @@ def compute_risk_metrics(J_matrix: tf.Tensor, lambdas: Optional[tf.Tensor] = Non
     }
 
 
+@tf.function
+def compute_risk_metrics_with_uncertainty(
+        J_matrix: tf.Tensor, lambdas: tf.Tensor,
+        v: tf.Tensor, sigma_interpolated: tf.Tensor) -> Dict[str, tf.Tensor]:
+    """
+    Compute risk metrics including vulnerability uncertainty via the law of
+    total variance.
+
+    Extends compute_risk_metrics by decomposing total loss variance into:
+    - Aleatory (event) variance: Var_events[E[Loss | event]]
+    - Vulnerability variance: E_events[Var_vuln[Loss | event]]
+
+    Using the law of total variance:
+        Var_total = Var_aleatory + Var_vulnerability
+        Var_vuln_i = Σ_q w_q × v_i² × σ²[u_i, m(i,q)]
+
+    Parameters
+    ----------
+    J_matrix : tf.Tensor, shape (N, Q), dtype float32
+        Loss matrix ∈ ℝ^(N×Q)
+    lambdas : tf.Tensor, shape (Q,), dtype float32
+        Scenario occurrence rates ∈ ℝ^Q
+    v : tf.Tensor, shape (N,), dtype float32
+        Exposure vector ∈ ℝ^N
+    sigma_interpolated : tf.Tensor, shape (N, Q), dtype float32
+        Interpolated vulnerability std dev at each asset-event intensity.
+
+    Returns
+    -------
+    metrics : dict
+        All keys from compute_risk_metrics, plus:
+
+        variance_vulnerability_per_asset : tf.Tensor, shape (N,)
+            Vulnerability uncertainty variance component per asset.
+        variance_vulnerability_portfolio : tf.Tensor, scalar
+            Portfolio-level vulnerability variance.
+        variance_total_per_asset : tf.Tensor, shape (N,)
+            Total variance = aleatory + vulnerability per asset.
+        std_total_per_asset : tf.Tensor, shape (N,)
+            Total standard deviation per asset.
+        variance_total_portfolio : tf.Tensor, scalar
+            Total portfolio variance.
+        std_total_portfolio : tf.Tensor, scalar
+            Total portfolio standard deviation.
+
+    Notes
+    -----
+    Fully differentiable w.r.t. J_matrix, lambdas, v, and sigma_interpolated.
+    """
+    # Base metrics (aleatory)
+    metrics = compute_risk_metrics(J_matrix, lambdas)
+
+    Lambda = metrics['total_rate']
+    w = lambdas / (Lambda + 1e-10)
+
+    # Vulnerability variance component per asset:
+    # Var_vuln_i = Σ_q w_q × v_i² × σ²_interpolated[i,q]
+    v_sq = tf.square(v)  # (N,)
+    sigma_sq = tf.square(sigma_interpolated)  # (N, Q)
+    var_vuln_per_asset = tf.reduce_sum(
+        sigma_sq * tf.expand_dims(w, 0), axis=1
+    ) * v_sq  # (N,)
+
+    var_vuln_portfolio = tf.reduce_sum(var_vuln_per_asset)
+
+    # Total variance (law of total variance)
+    var_total_per_asset = metrics['variance_per_asset'] + var_vuln_per_asset
+    var_total_portfolio = tf.reduce_sum(var_total_per_asset)
+    std_total_per_asset = tf.sqrt(var_total_per_asset)
+    std_total_portfolio = tf.sqrt(var_total_portfolio)
+
+    metrics['variance_vulnerability_per_asset'] = var_vuln_per_asset
+    metrics['variance_vulnerability_portfolio'] = var_vuln_portfolio
+    metrics['variance_total_per_asset'] = var_total_per_asset
+    metrics['std_total_per_asset'] = std_total_per_asset
+    metrics['variance_total_portfolio'] = var_total_portfolio
+    metrics['std_total_portfolio'] = std_total_portfolio
+
+    return metrics
+
+
 # ==========================================
 # 4. GRADIENT COMPUTATION ENGINE
 # ==========================================
@@ -544,14 +671,15 @@ class TensorialRiskEngine:
     >>> print("Most sensitive assets:", analysis['grad_exposure'].numpy().argsort()[-10:])
     """
     
-    def __init__(self, v: np.ndarray, u: np.ndarray, C: np.ndarray, 
-                 x_grid: np.ndarray, H: np.ndarray, lambdas: Optional[np.ndarray] = None):
+    def __init__(self, v: np.ndarray, u: np.ndarray, C: np.ndarray,
+                 x_grid: np.ndarray, H: np.ndarray, lambdas: Optional[np.ndarray] = None,
+                 Sigma: Optional[np.ndarray] = None, CoV: Optional[np.ndarray] = None):
         """
         Initialize the tensorial risk engine with portfolio data.
-        
+
         Converts NumPy arrays to TensorFlow tensors and stores them as either
         Variables (for parameters we want to differentiate) or Constants.
-        
+
         Parameters
         ----------
         v : np.ndarray, shape (N,)
@@ -567,29 +695,60 @@ class TensorialRiskEngine:
         lambdas : np.ndarray, shape (Q,), optional
             Scenario occurrence rate vector ∈ ℝ^Q
             If None, uniform rates (1/Q) will be used
-        
+        Sigma : np.ndarray, shape (K, M), optional
+            Vulnerability standard deviation matrix ∈ ℝ^(K×M)
+            Sigma[k,m] = std dev of MDR at intensity x_grid[m] for typology k.
+            Must satisfy Sigma² < C × (1 - C) for Beta distribution validity.
+            Mutually exclusive with CoV.
+        CoV : np.ndarray, shape (K,) or (K, M), optional
+            Coefficient of variation for vulnerability curves.
+            If shape (K,): scalar CoV per typology, Sigma = CoV[k] * C.
+            If shape (K, M): per-point CoV, Sigma = CoV * C.
+            Mutually exclusive with Sigma.
+
         Notes
         -----
         The initialization creates:
-        - tf.Variable for v, C, H, lambdas (differentiable parameters)
+        - tf.Variable for v, C, H, lambdas, Sigma (differentiable parameters)
         - tf.Constant for u, x_grid (non-differentiable indices/grid)
         - Backward compatible: lambdas defaults to uniform if not provided
+        - When Sigma is provided, vulnerability variance is propagated analytically
+          through the law of total variance
         """
         self.v = tf.Variable(v, dtype=tf.float32, name='exposure')
         self.u = tf.constant(u, dtype=tf.int32, name='typology')
         self.C = tf.Variable(C, dtype=tf.float32, name='vulnerability')
         self.x_grid = tf.constant(x_grid, dtype=tf.float32, name='grid')
         self.H = tf.Variable(H, dtype=tf.float32, name='hazard')
-        
+
         self.n_assets = v.shape[0]
         self.n_events = H.shape[1]
         self.n_typologies = C.shape[0]
-        
+
         # Scenario occurrence rates (Manuscript Section 3c)
         if lambdas is None:
             # Backward compatibility: uniform rates
             lambdas = np.ones(self.n_events, dtype=np.float32) / self.n_events
         self.lambdas = tf.Variable(lambdas, dtype=tf.float32, name='scenario_rates')
+
+        # Vulnerability uncertainty (Sigma matrix)
+        if Sigma is not None and CoV is not None:
+            raise ValueError("Provide either Sigma or CoV, not both.")
+
+        if CoV is not None:
+            CoV = np.asarray(CoV, dtype=np.float32)
+            if CoV.ndim == 1:
+                # Scalar CoV per typology: Sigma[k,m] = CoV[k] * C[k,m]
+                Sigma = CoV[:, np.newaxis] * C
+            else:
+                # Per-point CoV: Sigma[k,m] = CoV[k,m] * C[k,m]
+                Sigma = CoV * C
+
+        if Sigma is not None:
+            Sigma = np.asarray(Sigma, dtype=np.float32)
+            self.Sigma = tf.Variable(Sigma, dtype=tf.float32, name='sigma_vulnerability')
+        else:
+            self.Sigma = None
     
     def compute_loss_and_metrics(self) -> Tuple[tf.Tensor, Dict]:
         """
@@ -625,11 +784,30 @@ class TensorialRiskEngine:
         >>> print(f"Shape: {J_matrix.shape}")
         >>> print(f"AAL: ${metrics['aal_portfolio'].numpy():,.2f}")
         >>> print(f"Total rate Λ: {metrics['total_rate'].numpy():.4f}")
+
+        When Sigma is provided, metrics also contain:
+        - variance_vulnerability_per_asset : Vulnerability variance component ∈ ℝ^N
+        - variance_vulnerability_portfolio : Portfolio vulnerability variance (scalar)
+        - variance_total_per_asset : Total variance (aleatory + vulnerability) ∈ ℝ^N
+        - std_total_per_asset : Total std dev ∈ ℝ^N
+        - variance_total_portfolio : Total portfolio variance (scalar)
+        - std_total_portfolio : Total portfolio std dev (scalar)
         """
         J_matrix = probabilistic_loss_matrix(
             self.v, self.u, self.C, self.x_grid, self.H
         )
-        metrics = compute_risk_metrics(J_matrix, self.lambdas)
+
+        if self.Sigma is not None:
+            # Interpolate Sigma at hazard intensities
+            sigma_matrix = _interpolate_matrix(
+                self.u, self.Sigma, self.x_grid, self.H
+            )
+            metrics = compute_risk_metrics_with_uncertainty(
+                J_matrix, self.lambdas, self.v, sigma_matrix
+            )
+        else:
+            metrics = compute_risk_metrics(J_matrix, self.lambdas)
+
         return J_matrix, metrics
     
     def gradient_wrt_vulnerability(self) -> Tuple[tf.Tensor, Dict]:
@@ -849,7 +1027,54 @@ class TensorialRiskEngine:
         
         grad_lambdas = tape.gradient(aal, self.lambdas)
         return grad_lambdas, metrics
-    
+
+    def gradient_wrt_sigma(self) -> Tuple[tf.Tensor, Dict]:
+        """
+        Compute gradient of total portfolio variance w.r.t. vulnerability
+        uncertainty (Sigma matrix).
+
+        Calculates ∂(Var_total)/∂Σ using automatic differentiation.
+        The target is total variance (not AAL), because ∂AAL/∂Σ = 0 by
+        design — the mean loss depends only on C (mean MDR), not on Σ.
+
+        Requires that self.Sigma is not None.
+
+        Returns
+        -------
+        grad_Sigma : tf.Tensor, shape (K, M), dtype float32
+            Gradient of total portfolio variance w.r.t. Sigma matrix.
+            grad_Sigma[k,m] = ∂(Var_total_portfolio)/∂Σ[k,m]
+        metrics : dict
+            Current risk metrics including vulnerability variance decomposition.
+
+        Raises
+        ------
+        ValueError
+            If Sigma was not provided at engine initialization.
+
+        Notes
+        -----
+        - ∂AAL/∂Σ = 0 is mathematically correct (mean is independent of variance)
+        - This gradient targets variance: identifies which Sigma entries most
+          affect total portfolio risk dispersion
+        - Positive gradient means increasing Σ[k,m] increases total variance
+
+        Examples
+        --------
+        >>> engine = TensorialRiskEngine(v, u, C, x_grid, H, lambdas, Sigma=Sigma)
+        >>> grad_Sigma, metrics = engine.gradient_wrt_sigma()
+        >>> print(f"Max variance sensitivity: {grad_Sigma.numpy().max():.2e}")
+        """
+        if self.Sigma is None:
+            raise ValueError("Sigma not provided. Initialize engine with Sigma or CoV.")
+
+        with tf.GradientTape() as tape:
+            J_matrix, metrics = self.compute_loss_and_metrics()
+            target = metrics['variance_total_portfolio']
+
+        grad_Sigma = tape.gradient(target, self.Sigma)
+        return grad_Sigma, metrics
+
     def full_gradient_analysis(self) -> Dict:
         """
         Compute complete gradient analysis for all parameters (Manuscript Sections 3c-5c).
@@ -874,10 +1099,14 @@ class TensorialRiskEngine:
                 
             grad_lambdas : tf.Tensor, shape (Q,), dtype float32
                 ∂(AAL)/∂λ - Scenario occurrence rate sensitivity
-                
+
+            grad_sigma : tf.Tensor, shape (K, M), dtype float32, optional
+                ∂(Var_total)/∂Σ - Vulnerability uncertainty sensitivity.
+                Only present when Sigma was provided at initialization.
+
             metrics : dict
                 All rate-weighted risk metrics (AAL, variance, etc.)
-                
+
             loss_matrix : tf.Tensor, shape (N, Q), dtype float32
                 Complete loss matrix J ∈ ℝ^(N×Q)
         
@@ -923,18 +1152,17 @@ class TensorialRiskEngine:
         >>> hazard_sens = tf.reduce_mean(tf.abs(analysis['grad_hazard']))
         >>> print(f"Average hazard sensitivity: ${hazard_sens.numpy():.2f}/g")
         """
-        with tf.GradientTape(persistent=True) as tape:
+        with tf.GradientTape() as tape:
             J_matrix, metrics = self.compute_loss_and_metrics()
             aal = metrics['aal_portfolio']
-        
-        grad_H = tape.gradient(aal, self.H)
-        grad_C = tape.gradient(aal, self.C)
-        grad_v = tape.gradient(aal, self.v)
-        grad_lambdas = tape.gradient(aal, self.lambdas)
-        
-        del tape  # Clean up persistent tape
-        
-        return {
+
+        # Single backward pass for ALL gradients — the cheap gradient principle.
+        # With a scalar target and list of sources, TF traverses the graph once.
+        grad_H, grad_C, grad_v, grad_lambdas = tape.gradient(
+            aal, [self.H, self.C, self.v, self.lambdas]
+        )
+
+        result = {
             'grad_hazard': grad_H,
             'grad_vulnerability': grad_C,
             'grad_exposure': grad_v,
@@ -942,3 +1170,414 @@ class TensorialRiskEngine:
             'metrics': metrics,
             'loss_matrix': J_matrix
         }
+
+        # Sigma gradient targets variance, not AAL (∂AAL/∂Σ = 0 by design)
+        if self.Sigma is not None:
+            with tf.GradientTape() as tape_var:
+                J_matrix_v, metrics_v = self.compute_loss_and_metrics()
+                var_total = metrics_v['variance_total_portfolio']
+
+            result['grad_sigma'] = tape_var.gradient(var_total, self.Sigma)
+
+        return result
+
+
+# ==========================================
+# 6. CLASSICAL RISK (Hazard-Curve Convolution)
+# ==========================================
+
+@tf.function
+def classical_loss(v: tf.Tensor, u: tf.Tensor, C: tf.Tensor,
+                   x_grid: tf.Tensor, hazard_poes: tf.Tensor,
+                   hazard_imls: tf.Tensor) -> tf.Tensor:
+    """
+    Compute average annual loss per asset from hazard curves via classical risk
+    convolution (differentiable).
+
+    For each asset *i*, integrates the vulnerability mean-damage-ratio curve
+    against the hazard curve using the trapezoidal rule:
+
+        AAL_i = v_i × ∫ MDR(iml) × |dPoE/diml| diml
+              ≈ v_i × Σ_l  MDR(iml_l) × (PoE_{l-1} − PoE_l)
+
+    where PoE values decrease with increasing IML (exceedance probabilities),
+    so (PoE_{l-1} − PoE_l) represents the probability mass in each IML bin.
+
+    Parameters
+    ----------
+    v : tf.Tensor, shape (N,), dtype float32
+        Exposure values per asset.
+    u : tf.Tensor, shape (N,), dtype int32
+        Typology index per asset, values in {0, ..., K-1}.
+    C : tf.Tensor, shape (K, M), dtype float32
+        Vulnerability matrix (K curves × M curve points).
+    x_grid : tf.Tensor, shape (M,), dtype float32
+        Intensity grid for vulnerability curves.
+    hazard_poes : tf.Tensor, shape (N, L), dtype float32
+        Hazard PoE matrix — hazard_poes[i,l] = P(IML > imls[l]) at asset i.
+        Values should be monotonically decreasing along axis 1.
+    hazard_imls : tf.Tensor, shape (L,), dtype float32
+        IML levels corresponding to the hazard curve columns.
+
+    Returns
+    -------
+    avg_loss : tf.Tensor, shape (N,), dtype float32
+        Average annual loss per asset.
+
+    Notes
+    -----
+    Fully differentiable w.r.t. v, C, hazard_poes.
+    Uses the same linear interpolation scheme as probabilistic_loss_matrix
+    to evaluate vulnerability at hazard IML levels.
+    """
+    N = tf.shape(v)[0]
+    L = tf.shape(hazard_imls)[0]
+    M = tf.shape(x_grid)[0]
+
+    # Evaluate vulnerability at each hazard IML level for each asset
+    # Tile hazard_imls across assets: shape (N, L)
+    imls_tiled = tf.tile(tf.expand_dims(hazard_imls, 0), [N, 1])
+    imls_flat = tf.reshape(imls_tiled, [-1])  # (N*L,)
+
+    # Find grid indices for interpolation
+    idx = tf.searchsorted(x_grid, imls_flat, side='right') - 1
+    idx = tf.clip_by_value(idx, 0, M - 2)
+
+    x_lower = tf.gather(x_grid, idx)
+    x_upper = tf.gather(x_grid, idx + 1)
+    alpha = (imls_flat - x_lower) / (x_upper - x_lower + 1e-8)
+
+    # Repeat typology indices L times
+    u_repeated = tf.tile(tf.expand_dims(u, 1), [1, L])
+    u_flat = tf.reshape(u_repeated, [-1])  # (N*L,)
+
+    c_flat = tf.reshape(C, [-1])
+    flat_idx_lower = u_flat * M + idx
+    flat_idx_upper = u_flat * M + (idx + 1)
+
+    c_lower = tf.gather(c_flat, flat_idx_lower)
+    c_upper = tf.gather(c_flat, flat_idx_upper)
+
+    mdr_flat = (1.0 - alpha) * c_lower + alpha * c_upper
+    mdr_matrix = tf.reshape(mdr_flat, [N, L])  # (N, L)
+
+    # Compute ΔPoE = PoE_{l} - PoE_{l+1}  (probability mass in each bin)
+    # Append zero column at the end (PoE beyond last IML = 0)
+    poe_shifted = tf.concat([hazard_poes[:, 1:],
+                             tf.zeros([N, 1], dtype=tf.float32)], axis=1)
+    delta_poe = hazard_poes - poe_shifted  # (N, L), all >= 0
+
+    # AAL_i = v_i × Σ_l MDR(iml_l) × ΔPoE_l
+    avg_loss = v * tf.reduce_sum(mdr_matrix * delta_poe, axis=1)
+
+    return avg_loss
+
+
+# ==========================================
+# 7. FRAGILITY & DAMAGE STATE FUNCTIONS
+# ==========================================
+
+@tf.function
+def fragility_damage_distribution(u: tf.Tensor, F: tf.Tensor,
+                                  x_grid: tf.Tensor,
+                                  H: tf.Tensor) -> tf.Tensor:
+    """
+    Compute damage-state probability distributions from fragility curves
+    (differentiable).
+
+    For each asset *i* and event *q*, interpolates D fragility exceedance
+    curves at the intensity H[i,q], then converts exceedance probabilities
+    to damage-state probabilities via differencing:
+
+        P(ds_0) = 1 − P(exceed ds_1)
+        P(ds_d) = P(exceed ds_d) − P(exceed ds_{d+1})   for d = 1..D-1
+        P(ds_D) = P(exceed ds_D)
+
+    Parameters
+    ----------
+    u : tf.Tensor, shape (N,), dtype int32
+        Typology index per asset, values in {0, ..., K-1}.
+    F : tf.Tensor, shape (K, D, M), dtype float32
+        Fragility tensor — F[k,d,m] = P(exceeding limit-state d | IML = x_grid[m])
+        for typology k. D limit states, M IML points.
+    x_grid : tf.Tensor, shape (M,), dtype float32
+        Intensity grid for fragility curves (common across all typologies).
+    H : tf.Tensor, shape (N, Q), dtype float32
+        Hazard intensity matrix.
+
+    Returns
+    -------
+    damage_probs : tf.Tensor, shape (N, Q, D+1), dtype float32
+        Probability of each damage state per asset per event.
+        damage_probs[i,q,0] = P(no damage), ..., damage_probs[i,q,D] = P(complete).
+
+    Notes
+    -----
+    Fully differentiable w.r.t. F and H.
+    Uses the same linear interpolation as probabilistic_loss_matrix.
+    """
+    N = tf.shape(H)[0]
+    Q = tf.shape(H)[1]
+    K = tf.shape(F)[0]
+    D = tf.shape(F)[1]
+    M = tf.shape(F)[2]
+
+    H_flat = tf.reshape(H, [-1])  # (N*Q,)
+    NQ = tf.shape(H_flat)[0]
+
+    # Grid lookup
+    idx = tf.searchsorted(x_grid, H_flat, side='right') - 1
+    idx = tf.clip_by_value(idx, 0, M - 2)
+
+    x_lower = tf.gather(x_grid, idx)
+    x_upper = tf.gather(x_grid, idx + 1)
+    alpha = (H_flat - x_lower) / (x_upper - x_lower + 1e-8)  # (NQ,)
+
+    # Repeat typology indices Q times
+    u_repeated = tf.tile(tf.expand_dims(u, 1), [1, Q])
+    u_flat = tf.reshape(u_repeated, [-1])  # (NQ,)
+
+    # For each limit state d, interpolate F[u, d, :] at the intensity
+    # F is (K, D, M) — flatten to (K*D*M,)
+    f_flat = tf.reshape(F, [-1])
+
+    # Vectorised across all D limit states at once (no Python/tf.range loop)
+    # Build d indices: (D,) → tile to (D, NQ) → flatten to (D*NQ,)
+    d_range = tf.range(D)  # (D,)
+    d_tiled = tf.tile(tf.expand_dims(d_range, 1), [1, NQ])  # (D, NQ)
+    d_flat = tf.reshape(d_tiled, [-1])  # (D*NQ,)
+
+    # Repeat u_flat and idx D times
+    u_rep_d = tf.tile(tf.expand_dims(u_flat, 0), [D, 1])  # (D, NQ)
+    u_rep_d = tf.reshape(u_rep_d, [-1])  # (D*NQ,)
+    idx_rep_d = tf.tile(tf.expand_dims(idx, 0), [D, 1])   # (D, NQ)
+    idx_rep_d = tf.reshape(idx_rep_d, [-1])                # (D*NQ,)
+    alpha_rep_d = tf.tile(tf.expand_dims(alpha, 0), [D, 1])  # (D, NQ)
+    alpha_rep_d = tf.reshape(alpha_rep_d, [-1])               # (D*NQ,)
+
+    flat_lower_all = u_rep_d * (D * M) + d_flat * M + idx_rep_d
+    flat_upper_all = u_rep_d * (D * M) + d_flat * M + (idx_rep_d + 1)
+    f_lo_all = tf.gather(f_flat, flat_lower_all)
+    f_hi_all = tf.gather(f_flat, flat_upper_all)
+    exceed_flat = (1.0 - alpha_rep_d) * f_lo_all + alpha_rep_d * f_hi_all
+    exceed_flat = tf.clip_by_value(exceed_flat, 0.0, 1.0)
+
+    # Reshape to (D, NQ) then transpose to (NQ, D)
+    exceed_all = tf.reshape(exceed_flat, [D, NQ])
+    exceed_all = tf.transpose(exceed_all)  # (NQ, D)
+
+    # Convert exceedance to damage-state probabilities
+    # P(ds_0) = 1 - exceed[:,0]
+    # P(ds_d) = exceed[:,d] - exceed[:,d+1]  for d=0..D-2
+    # P(ds_D) = exceed[:, D-1]
+    p_no_damage = 1.0 - exceed_all[:, 0:1]  # (NQ, 1)
+    # Differences between consecutive limit states
+    p_intermediate = exceed_all[:, :-1] - exceed_all[:, 1:]  # (NQ, D-1)
+    p_complete = exceed_all[:, -1:]  # (NQ, 1)
+
+    damage_probs_flat = tf.concat([p_no_damage, p_intermediate, p_complete],
+                                  axis=1)  # (NQ, D+1)
+    damage_probs_flat = tf.maximum(damage_probs_flat, 0.0)  # numerical safety
+
+    damage_probs = tf.reshape(damage_probs_flat, [N, Q, D + 1])
+    return damage_probs
+
+
+@tf.function
+def consequence_loss(damage_probs: tf.Tensor, consequence_ratios: tf.Tensor,
+                     v: tf.Tensor, u: tf.Tensor) -> tf.Tensor:
+    """
+    Compute losses from damage-state probabilities and consequence ratios
+    (differentiable).
+
+    For each asset *i* and event *q*:
+        loss[i,q] = v[i] × Σ_d damage_probs[i,q,d] × consequence_ratios[u[i],d]
+
+    Parameters
+    ----------
+    damage_probs : tf.Tensor, shape (N, Q, D+1), dtype float32
+        Damage-state probabilities (from fragility_damage_distribution).
+    consequence_ratios : tf.Tensor, shape (K, D+1), dtype float32
+        Loss ratio per damage state per typology.
+        consequence_ratios[k,0] = loss ratio for no-damage (typically 0),
+        consequence_ratios[k,D] = loss ratio for complete damage (typically 1).
+    v : tf.Tensor, shape (N,), dtype float32
+        Exposure values per asset.
+    u : tf.Tensor, shape (N,), dtype int32
+        Typology index per asset, values in {0, ..., K-1}.
+
+    Returns
+    -------
+    loss_matrix : tf.Tensor, shape (N, Q), dtype float32
+        Loss per asset per event.
+
+    Notes
+    -----
+    Fully differentiable w.r.t. damage_probs, consequence_ratios, v.
+    """
+    # Gather consequence ratios for each asset's typology: (N, D+1)
+    cr_per_asset = tf.gather(consequence_ratios, u)  # (N, D+1)
+
+    # Weighted sum over damage states: (N, Q)
+    # damage_probs is (N, Q, D+1), cr_per_asset is (N, D+1)
+    # Expand cr to (N, 1, D+1) for broadcasting
+    cr_expanded = tf.expand_dims(cr_per_asset, 1)  # (N, 1, D+1)
+    mdr = tf.reduce_sum(damage_probs * cr_expanded, axis=2)  # (N, Q)
+
+    loss_matrix = tf.expand_dims(v, 1) * mdr  # (N, Q)
+    return loss_matrix
+
+
+# ==========================================
+# 8. CLASSICAL DAMAGE (Hazard-Curve × Fragility)
+# ==========================================
+
+@tf.function
+def classical_damage(u: tf.Tensor, F: tf.Tensor, x_grid: tf.Tensor,
+                     hazard_poes: tf.Tensor,
+                     hazard_imls: tf.Tensor) -> tf.Tensor:
+    """
+    Compute expected damage-state fractions per asset from hazard curves and
+    fragility functions (differentiable).
+
+    Integrates fragility exceedance probabilities against the hazard curve:
+
+        E[P(ds_d)] = ∫ P(ds_d | iml) × |dPoE/diml| diml
+
+    using the same ΔPoE discretization as classical_loss.
+
+    Parameters
+    ----------
+    u : tf.Tensor, shape (N,), dtype int32
+        Typology index per asset.
+    F : tf.Tensor, shape (K, D, M), dtype float32
+        Fragility tensor.
+    x_grid : tf.Tensor, shape (M,), dtype float32
+        Intensity grid for fragility curves.
+    hazard_poes : tf.Tensor, shape (N, L), dtype float32
+        Hazard PoE matrix.
+    hazard_imls : tf.Tensor, shape (L,), dtype float32
+        IML levels for hazard curves.
+
+    Returns
+    -------
+    expected_damage : tf.Tensor, shape (N, D+1), dtype float32
+        Expected fraction in each damage state per asset.
+
+    Notes
+    -----
+    Fully differentiable w.r.t. F, hazard_poes.
+    """
+    N = tf.shape(hazard_poes)[0]
+    L = tf.shape(hazard_imls)[0]
+    K = tf.shape(F)[0]
+    D = tf.shape(F)[1]
+    M = tf.shape(F)[2]
+
+    # Evaluate fragility at hazard IML levels
+    imls_tiled = tf.tile(tf.expand_dims(hazard_imls, 0), [N, 1])  # (N, L)
+    imls_flat = tf.reshape(imls_tiled, [-1])  # (N*L,)
+    NL = tf.shape(imls_flat)[0]
+
+    idx = tf.searchsorted(x_grid, imls_flat, side='right') - 1
+    idx = tf.clip_by_value(idx, 0, M - 2)
+
+    x_lower = tf.gather(x_grid, idx)
+    x_upper = tf.gather(x_grid, idx + 1)
+    alpha = (imls_flat - x_lower) / (x_upper - x_lower + 1e-8)
+
+    u_repeated = tf.tile(tf.expand_dims(u, 1), [1, L])
+    u_flat = tf.reshape(u_repeated, [-1])  # (NL,)
+
+    f_flat = tf.reshape(F, [-1])
+
+    # Vectorised across all D limit states at once (no tf.range loop)
+    d_range = tf.range(D)
+    d_tiled = tf.tile(tf.expand_dims(d_range, 1), [1, NL])  # (D, NL)
+    d_flat = tf.reshape(d_tiled, [-1])  # (D*NL,)
+
+    u_rep_d = tf.tile(tf.expand_dims(u_flat, 0), [D, 1])
+    u_rep_d = tf.reshape(u_rep_d, [-1])  # (D*NL,)
+    idx_rep_d = tf.tile(tf.expand_dims(idx, 0), [D, 1])
+    idx_rep_d = tf.reshape(idx_rep_d, [-1])
+    alpha_rep_d = tf.tile(tf.expand_dims(alpha, 0), [D, 1])
+    alpha_rep_d = tf.reshape(alpha_rep_d, [-1])
+
+    flat_lower_all = u_rep_d * (D * M) + d_flat * M + idx_rep_d
+    flat_upper_all = u_rep_d * (D * M) + d_flat * M + (idx_rep_d + 1)
+    f_lo_all = tf.gather(f_flat, flat_lower_all)
+    f_hi_all = tf.gather(f_flat, flat_upper_all)
+    exceed_flat = (1.0 - alpha_rep_d) * f_lo_all + alpha_rep_d * f_hi_all
+    exceed_flat = tf.clip_by_value(exceed_flat, 0.0, 1.0)
+
+    exceed_all = tf.reshape(exceed_flat, [D, NL])
+    exceed_all = tf.transpose(exceed_all)  # (NL, D)
+
+    # Convert to damage-state probs
+    p_no_damage = 1.0 - exceed_all[:, 0:1]
+    p_intermediate = exceed_all[:, :-1] - exceed_all[:, 1:]
+    p_complete = exceed_all[:, -1:]
+    damage_probs_flat = tf.concat([p_no_damage, p_intermediate, p_complete],
+                                  axis=1)  # (NL, D+1)
+    damage_probs_flat = tf.maximum(damage_probs_flat, 0.0)
+
+    damage_probs = tf.reshape(damage_probs_flat, [N, L, D + 1])  # (N, L, D+1)
+
+    # Compute ΔPoE
+    poe_shifted = tf.concat([hazard_poes[:, 1:],
+                             tf.zeros([N, 1], dtype=tf.float32)], axis=1)
+    delta_poe = hazard_poes - poe_shifted  # (N, L)
+
+    # Weight damage probs by ΔPoE and sum over IML levels
+    # (N, L, D+1) × (N, L, 1) → sum over L → (N, D+1)
+    delta_poe_expanded = tf.expand_dims(delta_poe, 2)  # (N, L, 1)
+    expected_damage = tf.reduce_sum(damage_probs * delta_poe_expanded, axis=1)
+
+    return expected_damage
+
+
+# ==========================================
+# 9. BENEFIT-COST RATIO
+# ==========================================
+
+@tf.function
+def benefit_cost_ratio(aal_original: tf.Tensor, aal_retrofitted: tf.Tensor,
+                       retrofit_cost: tf.Tensor,
+                       interest_rate: float = 0.05,
+                       asset_life_expectancy: float = 50.0) -> tf.Tensor:
+    """
+    Compute benefit-cost ratio for retrofitting (differentiable).
+
+    BCR_i = (AAL_original_i − AAL_retrofitted_i) × BPVF / retrofit_cost_i
+
+    where BPVF = (1 − (1+r)^(−T)) / r is the Benefit Present Value Factor.
+
+    Parameters
+    ----------
+    aal_original : tf.Tensor, shape (N,), dtype float32
+        Average annual loss per asset with original vulnerability.
+    aal_retrofitted : tf.Tensor, shape (N,), dtype float32
+        Average annual loss per asset with retrofitted vulnerability.
+    retrofit_cost : tf.Tensor, shape (N,), dtype float32
+        Cost of retrofitting each asset.
+    interest_rate : float
+        Annual discount rate (e.g. 0.05 for 5%).
+    asset_life_expectancy : float
+        Expected remaining life of the asset in years.
+
+    Returns
+    -------
+    bcr : tf.Tensor, shape (N,), dtype float32
+        Benefit-cost ratio per asset.
+
+    Notes
+    -----
+    Fully differentiable w.r.t. aal_original, aal_retrofitted, retrofit_cost.
+    """
+    r = tf.constant(interest_rate, dtype=tf.float32)
+    T = tf.constant(asset_life_expectancy, dtype=tf.float32)
+    bpvf = (1.0 - tf.pow(1.0 + r, -T)) / (r + 1e-10)
+
+    benefit = (aal_original - aal_retrofitted) * bpvf
+    bcr = benefit / (retrofit_cost + 1e-10)
+    return bcr
