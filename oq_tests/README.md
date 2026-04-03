@@ -107,8 +107,13 @@ oq-engine/
 │   ├── ScenarioRisk/
 │   ├── EventBasedRisk/
 │   └── Reinsurance/
-├── oq_verification/          ← this folder
-│   ├── run_verification.py
+├── oq_verification/              ← this folder
+│   ├── run_verification.py       # Accuracy comparison
+│   ├── run_gradient_verification.py  # Gradient AD vs FD verification
+│   ├── run_benchmark_oq.py       # Benchmark Phase 1 (OQ env)
+│   ├── run_benchmark_trisk.py    # Benchmark Phase 2 (T-Risk env)
+│   ├── run_benchmark_batched.py  # Batched benchmark with .npz caching
+│   ├── run_benchmark.sh          # Shell wrapper (both phases)
 │   ├── library_oq_import.py
 │   └── README.md
 └── ...
@@ -259,6 +264,214 @@ oq_verification/
 > will differ between runs.
 
 
+## Runtime Benchmark: OpenQuake vs T-Risk
+
+In addition to accuracy verification, this suite includes a **runtime benchmark**
+comparing OpenQuake's risk computation time against T-Risk's tensor-based engine.
+
+### Benchmark design
+
+The benchmark isolates **risk-only** computation time for a fair comparison:
+
+- **OpenQuake:** Hazard and risk are run separately using the `--hc` flag.
+  Only the risk calculation wall-clock time is measured.
+- **T-Risk:** Loads the same hazard CSV exports, builds tensorial arrays, and
+  runs `TensorialRiskEngine.compute_loss_and_metrics()`. Both data loading and
+  computation are timed separately.
+
+Both engines start from the same hazard outputs, so the comparison is apple-to-apple.
+
+### Demos benchmarked
+
+| Demo | Mode | Notes |
+|---|---|---|
+| ScenarioRisk | `scenario_risk` | 100 GMFs, combined hazard+risk (cannot split) |
+| EventBasedRisk | `event_based_risk` | ~17k events, hazard/risk split via `--hc` |
+| Reinsurance | `event_based_risk` | Same as EventBasedRisk + reinsurance layer |
+| EventBasedRisk_scaled | `event_based_risk` | 10× events (`ses_per_logic_tree_path=10`) |
+
+### How to run the benchmark
+
+There are two approaches:
+
+#### Option A: Automated (local, requires both environments)
+
+```bash
+cd oq_verification
+./run_benchmark.sh
+```
+
+This activates each virtual environment in turn and runs both phases.
+Edit `run_benchmark.sh` to adjust the virtualenv paths if needed.
+
+#### Option B: Manual (two separate steps)
+
+**Phase 1** — OQ timing (in the OQ environment):
+
+```bash
+source <path-to-oq-env>/bin/activate
+cd oq_verification
+python run_benchmark_oq.py
+```
+
+This runs each demo, measures OQ risk-only time, exports CSVs and timing
+data to `benchmark_outputs/`.
+
+**Phase 2** — T-Risk timing (in the T-Risk environment):
+
+```bash
+source <path-to-trisk-env>/bin/activate
+cd oq_verification
+python run_benchmark_trisk.py
+```
+
+This reads the OQ exports, runs the TensorialRiskEngine, and produces the
+final comparison summary and plots.
+
+### Benchmark outputs
+
+```
+oq_verification/
+├── benchmark_outputs/
+│   ├── oq_timing.json                    # OQ timing data (Phase 1 → Phase 2)
+│   ├── benchmark_summary.csv             # Final comparison table
+│   ├── ScenarioRisk/
+│   │   ├── *_<calc_id>.csv               # OQ CSV exports
+│   │   ├── oq_performance_risk.txt       # oq show performance output
+│   │   └── oq_performance_hazard.txt
+│   ├── EventBasedRisk/
+│   ├── EventBasedRisk_scaled/
+│   └── Reinsurance/
+├── benchmark_plots/
+│   ├── benchmark_comparison.png          # Side-by-side bar chart with speedup
+│   ├── benchmark_breakdown.png           # T-Risk load vs compute stacked bars
+│   └── benchmark_scaling.png             # Events vs time (scaling behavior)
+```
+
+### Reading the results
+
+The key output is `benchmark_outputs/benchmark_summary.csv` with columns:
+
+| Column | Description |
+|---|---|
+| `name` | Demo name |
+| `n_assets` | Number of exposure assets |
+| `n_events` | Number of hazard events |
+| `oq_risk_time_sec` | OQ risk-only wall-clock time |
+| `trisk_load_time_sec` | T-Risk CSV loading + array building time |
+| `trisk_compute_time_sec` | T-Risk `compute_loss_and_metrics()` time |
+| `trisk_total_time_sec` | T-Risk total (load + compute) |
+| `speedup` | OQ time / T-Risk time |
+
+
+## Gradient Verification: T-Risk AD vs Finite Differences
+
+This suite verifies T-Risk's automatic differentiation (AD) gradients against
+independent central finite differences (FD) and analytical baselines.
+
+### Gradients verified
+
+| Gradient | Dimensions | Verification method | Max error |
+|---|---|---|---|
+| **Vulnerability** `∂AAL/∂C` | K×M = 6×8 = 48 params | Central FD (δ=1e-4) | 0.017% |
+| **Exposure** `∂AAL/∂v` | N = 9,063 params | Analytical + FD (200 samples) | 0.00002% |
+
+### How to run
+
+In the T-Risk virtual environment:
+
+```bash
+source <path-to-trisk-env>/bin/activate
+cd oq_verification
+python run_gradient_verification.py
+```
+
+**Prerequisite:** `benchmark_outputs/ScenarioRisk/` must exist (from `run_benchmark_oq.py`).
+
+### What it does
+
+**Part A — Vulnerability gradient `∂AAL/∂C`:**
+1. Loads ScenarioRisk demo data (9,063 assets, 100 events, 6 typologies × 8 IML points)
+2. Computes T-Risk AD gradient via `gradient_wrt_vulnerability()` (single tape pass)
+3. Computes central FD gradient using T-Risk-native numpy interpolation (96 perturbations)
+4. Computes OQ-style FD gradient for cross-engine comparison
+5. Runs convergence sweep (δ = 1e-3, 1e-4, 1e-5)
+
+**Part B — Exposure gradient `∂AAL/∂v`:**
+6. Computes T-Risk AD gradient via `gradient_wrt_exposure()` (single tape pass)
+7. Computes analytical gradient: `∂AAL/∂v_i = Σ_q λ_q × MDR[i,q]` (exact for linear v)
+8. Computes central FD on 200 random assets with relative perturbation (δ_rel=1e-6)
+9. Reports per-typology exposure gradient statistics
+
+**Part C — Cross-engine OQ exposure gradient (`run_gradient_oq.py`):**
+10. Runs full OQ ScenarioRisk programmatically for baseline AAL
+11. Perturbs 50 random assets in the exposure CSV (δ_rel=1%)
+12. Computes central FD through the complete OQ pipeline (101 OQ runs)
+13. Compares OQ FD gradients with T-Risk AD gradients
+
+Run in the **OQ virtual environment**:
+```bash
+source <path-to-oq-env>/bin/activate
+cd oq_verification
+python run_gradient_oq.py
+```
+
+### Outputs
+
+```
+oq_verification/
+├── gradient_verification_result.json     # Full results with gradient arrays
+├── gradient_oq_exposure_result.json      # OQ FD exposure gradient (50 assets)
+├── benchmark_plots/
+│   ├── gradient_heatmaps.png             # AD vs FD side-by-side heatmaps
+│   ├── gradient_scatter.png              # FD vs AD scatter plot
+│   ├── gradient_scatter_oq.png           # OQ FD vs AD scatter (boundary divergence)
+│   ├── gradient_convergence.png          # FD error vs δ
+│   └── exposure_gradient.png             # AD vs analytical, AD vs FD, by-typology
+```
+
+### Expected results
+
+**Vulnerability gradient:**
+
+| Metric | Value |
+|---|---|
+| Max relative error (AD vs FD) | **0.017%** |
+| Mean relative error | 0.012% |
+| AD time | ~0.4s |
+| FD time (96 evaluations) | ~2.1s |
+| AD speedup | 5.8× |
+| Verdict | **PASS** (threshold: < 1%) |
+
+**Exposure gradient:**
+
+| Metric | Value |
+|---|---|
+| Max error (AD vs analytical, N=9,063) | **0.00002%** |
+| Max error (AD vs FD, sample=200) | 0.26% |
+| AD time | ~0.02s |
+| FD time (400 evaluations) | ~8.6s |
+| Projected AD speedup (full N) | ~10,000× |
+| Verdict | **PASS** |
+
+**OQ cross-engine exposure gradient:**
+
+| Metric | Value |
+|---|---|
+| OQ FD time per asset | 6.5s |
+| Total FD time (50 assets) | 5.4 min |
+| Projected full N (9,063) | **16.4 hours** |
+| T-Risk AD time (all 9,063) | **0.02s** |
+| Cross-engine speedup | ~3,000,000× |
+| Non-zero OQ FD gradients | 24/50 (48%) |
+| OQ FD precision issue | 52% zeros from float32 noise |
+
+**Cross-engine note:** When comparing against OQ-style interpolation (which clips
+GMVs to max IML instead of extrapolating), 10 boundary elements diverge by up to
+56%. This is a genuine semantic difference, not an error — see the LaTeX report
+for details.
+
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -268,3 +481,6 @@ oq_verification/
 | `RuntimeError: OQ run failed` | Check OQ installation: `oq run --help`. Inspect the full stderr in the error message. |
 | `FileNotFoundError: Missing export` | OQ may not have exported CSV files. Re-run with `oq run job.ini -e csv` manually in the demo directory. |
 | Portfolio ratio far from 1.0 | Ratios of 1.05–1.06 are expected. Values outside 0.90–1.15 suggest a data or configuration issue. |
+| `benchmark_outputs/ not found` | Run `run_benchmark_oq.py` first (Phase 1) before `run_benchmark_trisk.py` (Phase 2) |
+| `T-Risk directory not found` | Ensure `T-Hazard/T-Risk/` is alongside `oq-engine/` in the workspace |
+| `ModuleNotFoundError: tensorflow` | Activate the T-Risk virtual environment with TensorFlow installed |
