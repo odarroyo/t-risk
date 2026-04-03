@@ -305,3 +305,235 @@ def compute_uniform_event_rates(events_df: pd.DataFrame) -> np.ndarray:
         return np.zeros(0, dtype=np.float32)
     years = compute_catalog_years(events_df)
     return np.full(event_count, 1.0 / years, dtype=np.float32)
+
+
+# ==========================================
+# HAZARD CURVE LOADER (for classical risk)
+# ==========================================
+
+def load_oq_hazard_curves(csv_path: str, imt: str = 'PGA') -> tuple:
+    """Load OQ hazard-curve CSV export and return arrays.
+
+    OQ ``hcurves`` CSV has a header comment line listing the IML values, e.g.::
+
+        #,, imt="PGA" sa_period=... iml=0.01 0.02 ...
+        site_id, lon, lat, poe-0.01, poe-0.02, ...
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to ``hcurves-*.csv`` file exported from OQ.
+    imt : str
+        Intensity measure type to extract (e.g. ``'PGA'``, ``'SA(0.3)'``).
+
+    Returns
+    -------
+    site_ids : np.ndarray, shape (S,)
+        Site IDs in the order they appear in the CSV.
+    hazard_imls : np.ndarray, shape (L,), dtype float32
+        IML levels for the hazard curves.
+    hazard_poes : np.ndarray, shape (S, L), dtype float32
+        PoE matrix — hazard_poes[s, l] = P(IML > imls[l]) at site s.
+    lons : np.ndarray, shape (S,)
+    lats : np.ndarray, shape (S,)
+    """
+    import re as _re
+
+    # --- read and strip comment lines, extract IML header ---
+    with open(csv_path, encoding='utf-8') as fh:
+        raw_lines = fh.readlines()
+
+    comment_lines = [l for l in raw_lines if l.startswith('#')]
+    data_lines = [l for l in raw_lines if not l.startswith('#')]
+
+    # Find IML values for the requested IMT in comment lines
+    hazard_imls = None
+    for cline in comment_lines:
+        # OQ format: investigation_time=50, imt="PGA" ..., poe-0.01 poe-0.02 ...
+        # or header with iml values
+        if imt in cline:
+            # Try to extract float sequences after the IMT mention
+            floats = _re.findall(r'[\d.]+(?:[eE][+-]?\d+)?', cline.split(imt)[-1])
+            if len(floats) > 2:
+                hazard_imls = np.array([float(f) for f in floats], dtype=np.float32)
+                break
+
+    # Parse the data CSV
+    df = pd.read_csv(StringIO(''.join(data_lines)))
+    df.columns = df.columns.str.strip()
+
+    # Identify PoE columns — they contain the imt string or start with "poe-"
+    poe_cols = [c for c in df.columns if c.startswith('poe-') or c.startswith(f'{imt}-')]
+    if not poe_cols:
+        # Fallback: any numeric columns after lon/lat
+        skip = {'custom_site_id', 'site_id', 'sid', 'lon', 'lat'}
+        poe_cols = [c for c in df.columns if c not in skip]
+
+    poe_matrix = df[poe_cols].to_numpy(dtype=np.float32)
+
+    # If we couldn't parse IML values from comments, try from column names
+    if hazard_imls is None or len(hazard_imls) != poe_matrix.shape[1]:
+        imls_from_cols = []
+        for c in poe_cols:
+            nums = _re.findall(r'[\d.]+(?:[eE][+-]?\d+)?', c)
+            if nums:
+                imls_from_cols.append(float(nums[-1]))
+        if len(imls_from_cols) == poe_matrix.shape[1]:
+            hazard_imls = np.array(imls_from_cols, dtype=np.float32)
+        else:
+            raise ValueError(f"Cannot determine IML levels for IMT={imt} from {csv_path}")
+
+    # Site IDs
+    sid_col = 'custom_site_id' if 'custom_site_id' in df.columns else (
+        'sid' if 'sid' in df.columns else 'site_id')
+    site_ids = df[sid_col].to_numpy() if sid_col in df.columns else np.arange(len(df))
+    lons = df['lon'].to_numpy(dtype=np.float64) if 'lon' in df.columns else np.zeros(len(df))
+    lats = df['lat'].to_numpy(dtype=np.float64) if 'lat' in df.columns else np.zeros(len(df))
+
+    return site_ids, hazard_imls, poe_matrix, lons, lats
+
+
+# ==========================================
+# FRAGILITY XML LOADER
+# ==========================================
+
+def load_oq_fragility_xml(oq_inputs_dir: str, filename: str | None = None) -> tuple:
+    """Load OQ fragility model XML.
+
+    Returns
+    -------
+    limit_states : list[str]
+        Ordered limit-state names (e.g. ['slight', 'moderate', 'extreme', 'complete']).
+    fragility_df : pd.DataFrame
+        Long-form DataFrame with columns:
+        taxonomy, imt, point_index, iml, + one column per limit state with PoE values.
+    """
+    patterns = ['structural_fragility_model.xml', '*fragility*.xml']
+    if filename:
+        path = filename if os.path.isabs(filename) else os.path.join(oq_inputs_dir, filename)
+    else:
+        path = _find_latest_file(oq_inputs_dir, patterns)
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Fragility XML not found: {filename or oq_inputs_dir}")
+
+    root = ET.parse(path).getroot()
+
+    # Extract limit states
+    ls_node = root.find('.//{*}limitStates')
+    if ls_node is None:
+        raise ValueError("No <limitStates> found in fragility XML")
+    limit_states = ls_node.text.strip().split()
+
+    records = []
+    for func in root.findall('.//{*}fragilityFunction'):
+        taxonomy = func.get('id')
+        imls_node = func.find('{*}imls')
+        if imls_node is None:
+            continue
+        imt = imls_node.get('imt', 'PGA')
+        imls = [float(x) for x in (imls_node.text or '').split()]
+
+        poe_dict = {}
+        for ls in limit_states:
+            poe_node = func.find(f'{{*}}poes[@ls="{ls}"]')
+            if poe_node is not None:
+                poe_dict[ls] = [float(x) for x in (poe_node.text or '').split()]
+            else:
+                poe_dict[ls] = [0.0] * len(imls)
+
+        for i, iml in enumerate(imls):
+            row = {'taxonomy': taxonomy, 'imt': imt, 'point_index': i, 'iml': iml}
+            for ls in limit_states:
+                row[ls] = poe_dict[ls][i]
+            records.append(row)
+
+    if not records:
+        raise ValueError(f"No fragilityFunction nodes found in {path}")
+
+    return limit_states, pd.DataFrame(records)
+
+
+def fragility_to_trisk_arrays(
+    limit_states: list,
+    fragility_df: pd.DataFrame,
+    taxonomy_order: list | None = None,
+) -> tuple:
+    """Convert fragility DataFrame to T-Risk tensor arrays.
+
+    Returns
+    -------
+    x_grid : np.ndarray, shape (M,)
+    F_tensor : np.ndarray, shape (K, D, M)
+        F[k,d,m] = P(exceeding limit-state d | IML = x_grid[m]) for typology k.
+    taxonomy_to_index : dict[str, int]
+    """
+    D = len(limit_states)
+    if taxonomy_order is None:
+        taxonomy_order = fragility_df['taxonomy'].drop_duplicates().tolist()
+    K = len(taxonomy_order)
+
+    ref = fragility_df[fragility_df['taxonomy'] == taxonomy_order[0]].sort_values('point_index')
+    x_grid = ref['iml'].to_numpy(dtype=np.float32)
+    M = len(x_grid)
+
+    F_tensor = np.zeros((K, D, M), dtype=np.float32)
+    for k, tax in enumerate(taxonomy_order):
+        grp = fragility_df[fragility_df['taxonomy'] == tax].sort_values('point_index')
+        for d, ls in enumerate(limit_states):
+            F_tensor[k, d, :] = grp[ls].to_numpy(dtype=np.float32)
+
+    taxonomy_to_index = {tax: i for i, tax in enumerate(taxonomy_order)}
+    return x_grid, F_tensor, taxonomy_to_index
+
+
+# ==========================================
+# CONSEQUENCE CSV LOADER
+# ==========================================
+
+def load_oq_consequence_csv(csv_path: str, limit_states: list) -> tuple:
+    """Load OQ consequence CSV.
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to consequences CSV file.
+    limit_states : list[str]
+        Ordered limit state names matching the fragility model.
+
+    Returns
+    -------
+    consequence_ratios : dict[str, np.ndarray]
+        Mapping taxonomy → array of shape (D+1,) where index 0 = no-damage (always 0),
+        indices 1..D = consequence ratios for each limit state.
+    """
+    df = pd.read_csv(csv_path)
+    df.columns = df.columns.str.strip()
+
+    # Identify taxonomy column
+    tax_col = 'risk_id' if 'risk_id' in df.columns else 'taxonomy'
+
+    result = {}
+    for _, row in df.iterrows():
+        tax = row[tax_col]
+        ratios = [0.0]  # no-damage ratio = 0
+        for ls in limit_states:
+            ratios.append(float(row.get(ls, 0.0)))
+        result[tax] = np.array(ratios, dtype=np.float32)
+
+    return result
+
+
+def consequence_to_trisk_array(consequence_dict: dict, taxonomy_order: list) -> np.ndarray:
+    """Convert consequence dict to tensor array.
+
+    Returns
+    -------
+    consequence_ratios : np.ndarray, shape (K, D+1)
+    """
+    K = len(taxonomy_order)
+    D_plus_1 = len(next(iter(consequence_dict.values())))
+    arr = np.zeros((K, D_plus_1), dtype=np.float32)
+    for k, tax in enumerate(taxonomy_order):
+        if tax in consequence_dict:
+            arr[k] = consequence_dict[tax]
+    return arr
