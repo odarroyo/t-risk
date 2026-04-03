@@ -33,6 +33,11 @@ intensities where the mean loss ratio approaches 1.0 and significant probability
 mass falls above the truncation boundary.
 
 
+## Test platform
+
+All timings reported in this document were measured on an **Apple M4 Pro** processor
+with **14 CPU cores** and **20 GPU cores** (Apple MacBook Pro, ARM64).
+
 ## Prerequisites
 
 ### 1. Clone the repository
