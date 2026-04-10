@@ -4,6 +4,7 @@ This folder contains two independent scripts for running the Bogotá benchmark o
 
 - `run_trisk_hardware_benchmark.py`
 - `run_openquake_hardware_benchmark.py`
+- `plot_hardware_benchmark_results.py`
 
 Each script is intended to be run inside its own environment. The T-Risk script requires TensorFlow. The OpenQuake script requires OpenQuake and uses direct in-memory calls to OpenQuake risk-library functions, not `oq engine --run` or OpenQuake datastore exports.
 
@@ -143,6 +144,54 @@ For each timed operation, the JSON records:
 - `warmup`
 
 For manuscript-style reporting, use the compute timings, not the load time.
+
+## Processing and Plotting Results
+
+After running both benchmark scripts, place their JSON outputs in the same folder. For example:
+
+```text
+hardware_results/
+  trisk_hardware_benchmark_summary.json
+  openquake_hardware_benchmark_summary.json
+```
+
+Then run:
+
+```bash
+MPLCONFIGDIR=/tmp/trisk_mpl_config XDG_CACHE_HOME=/tmp/codex_cache \
+python plot_hardware_benchmark_results.py \
+  --results-dir hardware_results
+```
+
+The script automatically discovers the T-Risk and OpenQuake JSON files and writes figures to:
+
+```text
+hardware_results/figures/
+```
+
+Expected outputs include:
+
+- `hardware_benchmark_timing_summary.csv`
+- `hardware_benchmark_plot_summary.json`
+- `forward_runtime_by_im.png`
+- `vulnerability_runtime_by_im.png`
+- `exposure_runtime_by_im.png`
+- `speedup_summary_by_im.png`
+
+If both benchmark JSON files contain hazard-gradient timings, it also writes:
+
+- `hazard_runtime_by_im.png`
+- `hazard_gradient_runtime_scaling.png`
+- `hazard_gradient_runtime_share.png`
+
+If the JSON files have different names, pass them explicitly:
+
+```bash
+python plot_hardware_benchmark_results.py \
+  --results-dir hardware_results \
+  --trisk-json hardware_results/my_trisk_results.json \
+  --openquake-json hardware_results/my_openquake_results.json
+```
 
 ## OpenQuake and Numba Timing Assumptions
 
