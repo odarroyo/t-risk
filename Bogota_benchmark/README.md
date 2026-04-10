@@ -2,6 +2,7 @@
 
 This folder contains two independent scripts for running the Bogotá benchmark on other machines:
 
+- `download_zenodo_inputs.py`
 - `run_trisk_hardware_benchmark.py`
 - `run_openquake_hardware_benchmark.py`
 - `plot_hardware_benchmark_results.py`
@@ -16,6 +17,26 @@ Place these two files in the same directory as the scripts:
 - `bogota_hazard_chia.npz`
 
 These are the only data inputs required by both scripts.
+
+If `bogota_hazard_chia.npz` is not stored directly in the repository, download it from Zenodo:
+
+DOI:
+
+- `https://doi.org/10.5281/zenodo.19501460`
+
+Downloader command:
+
+```bash
+python download_zenodo_inputs.py
+```
+
+By default, the downloader stores:
+
+- `bogota_hazard_chia.npz`
+
+in the same directory as the scripts.
+
+If you already have the file locally, you can simply place it beside the scripts instead of using the downloader.
 
 ## T-Risk Script
 
@@ -208,6 +229,7 @@ The intended interpretation is:
 
 ## Notes
 
+- `download_zenodo_inputs.py` constructs the direct Zenodo download URL from the DOI and downloads `bogota_hazard_chia.npz`.
 - The OpenQuake script uses `openquake.risklib.scientific.VulnerabilityFunction` directly.
 - The OpenQuake script suppresses vulnerability uncertainty by using zero coefficients of variation and deterministic mean loss ratios.
 - The T-Risk script clips interpolation at the vulnerability-grid bounds to match the OpenQuake helper behavior.
