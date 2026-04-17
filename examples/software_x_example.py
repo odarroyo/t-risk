@@ -9,6 +9,12 @@ Created on Mon Feb 16 09:08:17 2026
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from tensor_engine import generate_synthetic_portfolio, TensorialRiskEngine
 
 # 1. Generate synthetic portfolio (1,000 assets, 5,000 events)
