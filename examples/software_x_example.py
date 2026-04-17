@@ -42,4 +42,7 @@ output_path = output_dir / 'J_matrix.png'
 plt.savefig(output_path, dpi=300)
 print(f"J matrix plot saved to: {output_path}")
 
-plt.show()
+plt.close()
+
+if not output_path.exists():
+    raise RuntimeError(f"Expected output file was not created: {output_path}")
