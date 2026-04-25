@@ -1,7 +1,7 @@
 # T-Risk: Tensorial Risk Engine
 
-T-Risk is a differentiable catastrophe risk engine that expresses portfolio
-risk calculations as tensor programs. The core implementation uses TensorFlow
+T-Risk is a differentiable disaster risk engine that expresses portfolio
+risk calculations as tensors. The core implementation uses TensorFlow
 to compute event-based losses, risk metrics, and automatic-differentiation
 gradients for large asset portfolios.
 
